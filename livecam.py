@@ -52,10 +52,11 @@ ZM_DB_PASSWORD = os.environ.get("ZM_DB_PASSWORD")
 ZM_DB_NAME = os.environ.get("ZM_DB_NAME", "zm")
 
 # A full-resolution viewer costs ~7 Mbps (~2.95 GB/hour). Past this many
-# concurrent live sessions the home uplink, not the CPU, becomes the limit
-# -- roughly 70 Mbps at ten viewers, more than many connections have. Rather
-# than let a spike stutter for everyone, extra viewers are served the
-# substream (~0.62 Mbps), which go2rtc already publishes.
+# *concurrent full-quality* streams the home uplink, not the CPU, becomes
+# the limit -- roughly 70 Mbps at ten viewers, more than many connections
+# have. Rather than let a spike stutter for everyone, further expands are
+# served the substream instead. Grid tiles are already substream and are
+# never capped.
 MAX_FULL_QUALITY_SESSIONS = int(os.environ.get("MAX_FULL_QUALITY_SESSIONS", "4"))
 
 # An abandoned tab is the real cost risk, not active watching: left running
@@ -73,6 +74,12 @@ IDLE_PROMPT_SECONDS = int(os.environ.get("IDLE_PROMPT_SECONDS", str(max(60, HEAR
 
 _sessions_lock = threading.Lock()
 _live_sessions = {}  # stream_token -> last heartbeat epoch
+
+# In-flight full-quality streams, so the cap below counts what is actually
+# being transferred rather than how many people have a page open. Tiles are
+# never counted -- they are cheap enough that grid viewing never needs
+# capping.
+_full_streams = set()
 
 # Only these carry actual video/audio. Everything else passes through to ZM
 # untouched. Verify against the installed ZM version -- these were written
@@ -152,21 +159,29 @@ def _prune_stale_sessions():
         return len(_live_sessions)
 
 
-def resolve_stream_name(camera, audio_allowed, use_substream):
-    """Map (camera, permissions, load) onto one of go2rtc's stream names.
+def resolve_stream_name(camera, audio_allowed, quality):
+    """Map (camera, permissions, requested quality) onto a go2rtc stream.
 
     Audio gating is enforced by *which stream is requested*: the `_noaudio`
     variants are published by go2rtc with the audio track genuinely removed
     (verified against a live camera -- the track list is video-only, not
     merely muted), so a user without audio permission cannot receive audio
     even if they tamper with the client.
+
+    Grid tiles get the camera's own 704x480 substream (~0.65 Mbps) rather
+    than the full 2960x1668 feed (~7.04 Mbps) -- about 11x cheaper, which
+    matters because remote viewers traverse the home uplink and billed AWS
+    egress. There is no server-side downscale involved: changing resolution
+    means decode + scale + re-encode, the workload that previously pinned
+    the NVR host. The camera encodes the substream itself, so it is free.
+
+    Tiles are always muted, so they take the audio-free substream too --
+    that way a tile genuinely cannot carry audio rather than relying on the
+    client honouring a `muted` attribute.
     """
-    name = camera
-    if use_substream:
-        name += "_sub"
-    if not audio_allowed:
-        name += "_noaudio"
-    return name
+    if quality != "full":
+        return f"{camera}_sub_noaudio"
+    return camera if audio_allowed else f"{camera}_noaudio"
 
 
 @app.route("/api/heartbeat", methods=["POST"])
@@ -202,9 +217,21 @@ def live(camera):
     if not token or not known:
         abort(403)
 
-    active = _prune_stale_sessions()
-    stream = resolve_stream_name(camera, audio_allowed,
-                                 active > MAX_FULL_QUALITY_SESSIONS)
+    _prune_stale_sessions()
+
+    # Defaults to the cheap stream: anything that forgets to ask for a
+    # quality gets the substream rather than silently costing 7 Mbps.
+    quality = "full" if request.args.get("quality") == "full" else "sub"
+    stream_id = None
+    if quality == "full":
+        with _sessions_lock:
+            if len(_full_streams) >= MAX_FULL_QUALITY_SESSIONS:
+                quality = "sub"          # degrade rather than refuse
+            else:
+                stream_id = object()
+                _full_streams.add(stream_id)
+
+    stream = resolve_stream_name(camera, audio_allowed, quality)
 
     upstream = requests.get(
         f"{GO2RTC_URL}/api/stream.mp4",
@@ -213,7 +240,8 @@ def live(camera):
         timeout=15,
     )
 
-    log.info("live start camera=%s stream=%s user=%s", camera, stream, username)
+    log.info("live start camera=%s stream=%s quality=%s user=%s",
+             camera, stream, quality, username)
 
     def pump():
         sent = 0
@@ -236,7 +264,11 @@ def live(camera):
                 yield chunk
         finally:
             upstream.close()
-            log.info("live end camera=%s reason=%s bytes=%d", camera, why, sent)
+            if stream_id is not None:
+                with _sessions_lock:
+                    _full_streams.discard(stream_id)
+            log.info("live end camera=%s quality=%s reason=%s bytes=%d",
+                     camera, quality, why, sent)
 
     resp = Response(stream_with_context(pump()), content_type="video/mp4")
     resp.headers["X-Livecam-Stream"] = stream
@@ -263,14 +295,13 @@ def dashboard():
     token = secrets.token_urlsafe(24)
     with _sessions_lock:
         _live_sessions[token] = time.time()
-    active = _prune_stale_sessions()
+    _prune_stale_sessions()
 
     return render_template(
         "index.html",
         username=username,
         cameras=sorted(allowed_cameras),
         audio_allowed=audio_allowed,
-        substream=active > MAX_FULL_QUALITY_SESSIONS,
         token=token,
         idle_prompt_seconds=IDLE_PROMPT_SECONDS,
     )

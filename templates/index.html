@@ -12,13 +12,23 @@
   header .who { color:#9aa3b2; font-size:.85rem; }
   header a { margin-left:auto; color:#7db3ff; text-decoration:none; font-size:.85rem; }
   .grid { display:grid; gap:1rem; padding:1rem; grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr)); }
-  figure { margin:0; background:#1c1f26; border:1px solid #2a2f3a; border-radius:8px; overflow:hidden; }
+  figure { margin:0; background:#1c1f26; border:1px solid #2a2f3a; border-radius:8px; overflow:hidden; cursor:pointer; }
+  figure:hover { border-color:#3d4757; }
   figure video { width:100%; display:block; background:#000; aspect-ratio:16/9; object-fit:contain; }
   figcaption { display:flex; align-items:center; gap:.5rem; padding:.5rem .75rem; font-size:.9rem; }
   .badge { font-size:.7rem; padding:.1rem .4rem; border-radius:4px; background:#2a2f3a; color:#9aa3b2; }
+  .hint { margin-left:auto; color:#6b7484; font-size:.75rem; }
   .empty { padding:2rem 1rem; color:#9aa3b2; }
   dialog { border:1px solid #2a2f3a; background:#1c1f26; color:#e8eaed; border-radius:8px; padding:1.25rem; }
   dialog button { margin-top:1rem; padding:.5rem 1rem; border-radius:6px; border:0; background:#2f6fd0; color:#fff; font-size:1rem; }
+  #overlay[hidden] { display:none; }
+  #overlay { position:fixed; inset:0; background:#000d; backdrop-filter:blur(4px); z-index:50;
+             display:flex; flex-direction:column; }
+  #overlay .bar { display:flex; align-items:center; gap:.75rem; padding:.6rem 1rem; background:#1c1f26cc; }
+  #overlay .bar strong { font-size:.95rem; }
+  #overlay .bar button { margin-left:auto; background:#2a2f3a; color:#e8eaed; border:0; border-radius:6px;
+                         padding:.4rem .8rem; font-size:.85rem; cursor:pointer; }
+  #overlay video { flex:1; min-height:0; width:100%; background:#000; object-fit:contain; }
 </style>
 </head>
 <body>
@@ -29,14 +39,14 @@
 </header>
 
 {% if cameras %}
-<div class="grid">
+<div class="grid" id="grid">
   {% for cam in cameras %}
-  <figure>
-    <video src="/live/{{ cam }}?token={{ token }}" autoplay muted playsinline preload="none"></video>
+  <figure data-camera="{{ cam }}" tabindex="0">
+    <video data-camera="{{ cam }}" autoplay muted playsinline preload="none"></video>
     <figcaption>
       {{ cam }}
-      <span class="badge">{{ 'audio' if audio_allowed else 'no audio' }}</span>
-      {% if substream %}<span class="badge">reduced quality</span>{% endif %}
+      <span class="badge">preview</span>
+      <span class="hint">click for full quality</span>
     </figcaption>
   </figure>
   {% endfor %}
@@ -45,6 +55,15 @@
 <p class="empty">No cameras are available to you right now. This can mean none are assigned to your account, or you're outside your permitted viewing hours.</p>
 {% endif %}
 
+<div id="overlay" hidden>
+  <div class="bar">
+    <strong id="overlayName"></strong>
+    <span class="badge">full quality{{ ' + audio' if audio_allowed else '' }}</span>
+    <button id="closeBtn" type="button">Close (Esc)</button>
+  </div>
+  <video id="overlayVideo" autoplay playsinline{{ '' if audio_allowed else ' muted' }}></video>
+</div>
+
 <dialog id="idle">
   <strong>Still watching?</strong>
   <p>Streaming paused to avoid using bandwidth in the background.</p>
@@ -52,25 +71,72 @@
 </dialog>
 
 <script>
-// Streams are torn down server-side when heartbeats stop, so an abandoned
-// tab stops transferring rather than running until the browser is closed.
-// A full-resolution viewer costs roughly 2.95 GB/hour.
+// Tiles deliberately pull the camera's own low-res substream (~0.65 Mbps)
+// rather than the full 2960x1668 feed (~7.04 Mbps). Full quality is fetched
+// only for the one camera actually being looked at. There is no server-side
+// downscale involved -- that would mean decode+scale+re-encode, which is the
+// exact workload that previously pinned the NVR host.
 const TOKEN = {{ token | tojson }};
 const IDLE_MS = {{ idle_prompt_seconds }} * 1000;
 const BEAT_MS = 60000;
 
+const tiles = Array.from(document.querySelectorAll('#grid video'));
+const overlay = document.getElementById('overlay');
+const overlayVideo = document.getElementById('overlayVideo');
+const overlayName = document.getElementById('overlayName');
+const dlg = document.getElementById('idle');
+
+const src = (cam, q) => `/live/${encodeURIComponent(cam)}?token=${encodeURIComponent(TOKEN)}&quality=${q}`;
+
+function stopVideo(v) { v.pause(); v.removeAttribute('src'); v.load(); }
+
+function startTiles() { tiles.forEach(v => { v.src = src(v.dataset.camera, 'sub'); }); }
+// Stopping the tiles matters: otherwise an expanded view costs the full
+// stream *plus* every tile still running, and the expanded camera is paid
+// for twice.
+function stopTiles() { tiles.forEach(stopVideo); }
+
+function expand(cam) {
+  if (!overlay.hidden) return;
+  stopTiles();
+  overlayName.textContent = cam;
+  overlay.hidden = false;
+  overlayVideo.src = src(cam, 'full');
+  // History entry so the browser Back button is a natural way out, which
+  // the native Fullscreen API cannot offer (Esc exits it, Back does not).
+  history.pushState({ expanded: cam }, '');
+}
+
+function collapse() {
+  if (overlay.hidden) return;
+  stopVideo(overlayVideo);
+  overlay.hidden = true;
+  startTiles();
+}
+
+// Esc and the close button both go through history.back(), so every exit
+// path pops the same entry and the history stays consistent.
+function requestClose() { if (!overlay.hidden) history.back(); }
+
+document.querySelectorAll('#grid figure').forEach(fig => {
+  fig.addEventListener('click', () => expand(fig.dataset.camera));
+  fig.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); expand(fig.dataset.camera); }
+  });
+});
+document.getElementById('closeBtn').addEventListener('click', requestClose);
+addEventListener('keydown', e => { if (e.key === 'Escape') requestClose(); });
+addEventListener('popstate', collapse);
+
 let lastActive = Date.now();
 let beat = null;
-const dlg = document.getElementById('idle');
 
 ['mousemove','keydown','click','touchstart','scroll'].forEach(
   e => addEventListener(e, () => { lastActive = Date.now(); }, {passive:true}));
 
 async function sendBeat() {
-  if (Date.now() - lastActive > IDLE_MS) return pause();
-  // Pause while the tab is hidden too -- a backgrounded tab is still
-  // pulling video otherwise.
-  if (document.hidden) return;
+  if (Date.now() - lastActive > IDLE_MS) return pauseAll();
+  if (document.hidden) return;   // a backgrounded tab otherwise keeps pulling video
   try {
     await fetch('/api/heartbeat', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -79,9 +145,9 @@ async function sendBeat() {
   } catch (e) { /* transient; next beat retries */ }
 }
 
-function pause() {
+function pauseAll() {
   clearInterval(beat); beat = null;
-  document.querySelectorAll('video').forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); });
+  stopTiles(); stopVideo(overlayVideo);
   if (!dlg.open) dlg.showModal();
 }
 
@@ -89,6 +155,7 @@ document.getElementById('resume').addEventListener('click', () => {
   dlg.close(); lastActive = Date.now(); location.reload();
 });
 
+startTiles();
 sendBeat();
 beat = setInterval(sendBeat, BEAT_MS);
 </script>
