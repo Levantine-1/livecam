@@ -186,18 +186,115 @@ const AUDIO_ALLOWED = {{ audio_allowed | tojson }};
 // Native HLS is the way in on WebKit, and canPlayType is the honest test
 // for it: Safari answers "maybe"/"probably", Chrome and Firefox answer "".
 // They keep the MP4 path, which has lower latency and already works.
-const NATIVE_HLS = !!document.createElement('video')
-  .canPlayType('application/vnd.apple.mpegurl');
+// Which transport to try first.
+//
+// canPlayType alone is NOT the answer, though it looks like it: Android
+// Chrome answers "maybe" for HLS because Android's platform media stack
+// advertises it, then fails to play what this app serves. Trusting that
+// claim moved every Android phone off the MP4 path that worked and onto one
+// that did not -- blank tiles and a dead expanded view.
+//
+// So the claim must be corroborated by the platform actually being Apple's,
+// where WebKit is the only engine available and native HLS is the real and
+// only option. Everything else keeps MP4, which is lower latency anyway.
+// Whatever this gets wrong, the fallback below repairs at runtime.
+function prefersHls() {
+  const ua = navigator.userAgent || '';
+  if (!document.createElement('video').canPlayType('application/vnd.apple.mpegurl')) {
+    return false;
+  }
+  if (/iPhone|iPad|iPod/.test(ua)) return true;
+  // iPadOS 13+ reports itself as a Mac; touch points are what give it away.
+  if (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) return true;
+  // Safari on macOS: says Safari without any of the engines that borrow the
+  // token. CriOS/FxiOS are iOS browsers, already caught above.
+  if (/Safari/.test(ua) &&
+      !/Chrome|Chromium|Android|CriOS|FxiOS|Edg|OPR|SamsungBrowser/.test(ua)) return true;
+  return false;
+}
 
-const src = (cam, q, audio) => {
+let transport = prefersHls() ? 'hls' : 'mp4';
+// Exposed for the sound control, which must skip the WebAudio graph on
+// natively-played HLS.
+const usingHls = () => transport === 'hls';
+
+function urlFor(cam, q, audio, t) {
   const qs = `token=${encodeURIComponent(TOKEN)}&quality=${q}` + (audio ? '&audio=1' : '');
   const cameraPath = encodeURIComponent(cam);
-  return NATIVE_HLS
+  return t === 'hls'
     ? `/live/${cameraPath}/master.m3u8?${qs}`
     : `/live/${cameraPath}?${qs}`;
-};
+}
 
-function stopVideo(v) { v.pause(); v.removeAttribute('src'); v.load(); }
+// Belt and braces for a guess that cannot be verified on every device: start
+// with the preferred transport, and if playback has not actually begun,
+// switch to the other one and try again. A browser that cannot play a
+// transport does not always say so -- iOS just sits there -- so this treats
+// "no progress" as failure rather than waiting for an error event that may
+// never arrive.
+const TRANSPORT_TIMEOUT_MS = 6000;
+
+function startStream(v, cam, quality, audio, onBlocked) {
+  const tried = new Set();
+
+  function attempt(t) {
+    tried.add(t);
+    let settled = false, timer = null;
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      v.removeEventListener('playing', succeed);
+      v.removeEventListener('error', fail);
+    };
+    const succeed = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      // Remember what actually worked, so other tiles and the expanded view
+      // go straight there instead of each paying the timeout.
+      transport = t;
+    };
+    const fail = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const other = t === 'hls' ? 'mp4' : 'hls';
+      if (!tried.has(other)) {
+        attempt(other);
+      } else if (onBlocked) {
+        onBlocked();
+      }
+    };
+
+    v.addEventListener('playing', succeed);
+    v.addEventListener('error', fail);
+    timer = setTimeout(() => { if (v.currentTime > 0) succeed(); else fail(); },
+                       TRANSPORT_TIMEOUT_MS);
+
+    // Deliberately stopping a video must also abandon its pending fallback.
+    // Otherwise expanding a camera -- which stops every tile -- leaves timers
+    // that fire seconds later, re-set src, and quietly restart the tiles
+    // behind the overlay, paying for the expanded camera twice over.
+    v._abandonStream = () => { settled = true; cleanup(); };
+
+    v.src = urlFor(cam, quality, audio, t);
+    const p = v.play();
+    // A rejected play() is an autoplay refusal, not a broken transport --
+    // the tap-to-play path handles that, so do not burn the fallback on it.
+    if (p && typeof p.catch === 'function') {
+      p.catch(() => { if (!settled) { settled = true; cleanup(); onBlocked && onBlocked(); } });
+    }
+  }
+
+  attempt(transport);
+}
+
+function stopVideo(v) {
+  if (v._abandonStream) { v._abandonStream(); v._abandonStream = null; }
+  v.pause();
+  v.removeAttribute('src');
+  v.load();
+}
 
 const notice = document.getElementById('overlayNotice');
 function say(msg) {
@@ -224,21 +321,8 @@ tiles.forEach(v => showRes(v, v.closest('figure').querySelector('.res')));
 
 showRes(overlayVideo, document.getElementById('overlayRes'));
 
-// play() returns a promise that *rejects* when a browser declines to start,
-// and an unhandled rejection is invisible -- which is how a blocked tile
-// ends up looking like a still image with nothing in the console. Autoplay
-// rules differ by platform and by how much the user has interacted with the
-// site, so the only reliable approach is to ask, then react to the answer.
-function playSafely(v, onBlocked) {
-  const p = v.play();
-  if (p && typeof p.catch === 'function') p.catch(() => onBlocked && onBlocked());
-}
-
 function startTiles() {
-  tiles.forEach(v => {
-    v.src = src(v.dataset.camera, 'sub');
-    playSafely(v, showTapToPlay);
-  });
+  tiles.forEach(v => startStream(v, v.dataset.camera, 'sub', false, showTapToPlay));
 }
 
 // If the browser refuses, say so and offer the one thing that fixes it: a
@@ -262,10 +346,8 @@ let currentQuality = 'full';
 
 function loadOverlay(cam, quality, audio) {
   currentQuality = quality;
-  overlayVideo.src = src(cam, quality, audio);
-  // Normally fine -- expanding is always preceded by a tap -- but say so
-  // rather than showing a frozen frame if a browser still declines.
-  playSafely(overlayVideo, () => say('Tap the video to start playback.'));
+  startStream(overlayVideo, cam, quality, audio,
+              () => say('Tap the video to start playback.'));
   watchForStall();
 }
 
@@ -358,11 +440,11 @@ if (soundBtn) {
     // volume property outright (the hardware buttons own it). Better to
     // hand over plain unmuted audio than a slider that does nothing or,
     // worse, mutes it.
-    if (soundOn && !NATIVE_HLS) {
+    if (soundOn && !usingHls()) {
       ensureGraph();
       if (ctx.state === 'suspended') ctx.resume();
     }
-    gainWrap.hidden = !soundOn || NATIVE_HLS;
+    gainWrap.hidden = !soundOn || usingHls();
     overlayVideo.muted = !soundOn;
     // The audio-free and audio-bearing feeds are different go2rtc streams,
     // so switching sound means re-requesting -- the server decides which,
@@ -464,8 +546,7 @@ async function refreshUsage() {
 // playing from inside this handler is what makes it work.
 tapToPlay.addEventListener('click', () => {
   tapToPlay.hidden = true;
-  tiles.forEach(v => { if (!v.getAttribute('src')) v.src = src(v.dataset.camera, 'sub'); });
-  tiles.forEach(v => playSafely(v));
+  tiles.forEach(v => startStream(v, v.dataset.camera, 'sub', false));
 });
 
 // Phones stop decoding when the tab goes to the background and do not always
@@ -474,7 +555,7 @@ tapToPlay.addEventListener('click', () => {
 // expanded (the overlay owns the screen in that case).
 addEventListener('visibilitychange', () => {
   if (document.hidden || !overlay.hidden || dlg.open) return;
-  tiles.forEach(v => { if (v.paused && v.getAttribute('src')) playSafely(v, showTapToPlay); });
+  tiles.forEach(v => { if (v.paused) startStream(v, v.dataset.camera, 'sub', false, showTapToPlay); });
 });
 
 startTiles();

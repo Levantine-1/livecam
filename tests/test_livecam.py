@@ -141,6 +141,23 @@ def main():
     check("the tap-to-play fallback exists for when autoplay is refused",
           'id="tapToPlay"' in page)
 
+    # Transport selection, checked in the page source because it decides
+    # whether a whole platform can play anything at all.
+    #
+    # Selecting on canPlayType alone shipped a regression: Android Chrome
+    # answers "maybe" for HLS because Android's media stack advertises it,
+    # then cannot play what this app serves -- so every Android phone moved
+    # off the working MP4 path onto a dead one. The claim now has to be
+    # corroborated by the platform actually being Apple's.
+    check("HLS is not chosen on canPlayType alone",
+          "iPhone|iPad|iPod" in page and "maxTouchPoints" in page)
+    check("Chromium and Android are explicitly excluded from the HLS path",
+          "Android" in page and "CriOS" in page and "SamsungBrowser" in page)
+    # A wrong guess must repair itself, since these platforms cannot all be
+    # tested before shipping.
+    check("a failed transport falls back to the other one",
+          "TRANSPORT_TIMEOUT_MS" in page and "_abandonStream" in page)
+
     perms = livecam.load_permissions()
     allowed, audio = livecam.check_permission("admin", perms)
     check("admin: both cameras, audio on",
