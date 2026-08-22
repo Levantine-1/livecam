@@ -285,6 +285,26 @@ def main():
         "/live/guinea-pig-cage-1/master.m3u8", headers={"Host": LAN})
     check("HLS master requires a login", r.status_code in (302, 401), r.status_code)
 
+    # The full-quality cap counts sessions seen *recently*, not every session
+    # inside the 5-minute auth TTL. Counting over the TTL meant four expands
+    # in five minutes silently downgraded the fifth long after nobody was
+    # watching -- caught live, when a full-quality request came back as the
+    # substream for no visible reason.
+    now = __import__("time").time()
+    with livecam._hls_lock:
+        livecam._hls_sessions.clear()
+        for i in range(livecam.MAX_FULL_QUALITY_SESSIONS + 2):
+            livecam._hls_sessions[f"stale{i}"] = {
+                "user": "admin", "camera": "guinea-pig-cage-1", "quality": "full",
+                "metered": False, "seen": now - livecam.HLS_ACTIVE_SECONDS - 5,
+            }
+        stale_full = sum(
+            1 for v in livecam._hls_sessions.values()
+            if v["quality"] == "full" and v["seen"] >= now - livecam.HLS_ACTIVE_SECONDS)
+        livecam._hls_sessions.clear()
+    check("sessions idle past the activity window stop counting against the cap",
+          stale_full == 0, stale_full)
+
     # --- LAN switch: ping, handoff ---
     fresh = app.test_client()
     r = fresh.get("/api/ping", headers={"Host": LAN})

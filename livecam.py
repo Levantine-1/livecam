@@ -580,6 +580,10 @@ M3U8_CONTENT_TYPE = "application/vnd.apple.mpegurl"
 # user and camera is what lets the playlist and segment requests below be
 # authorised, since they carry only that id.
 HLS_SESSION_TTL_SECONDS = int(os.environ.get("HLS_SESSION_TTL_SECONDS", "300"))
+# How recently a session must have fetched something to count as "someone is
+# watching this right now". Segments arrive every ~0.5s, so this is generous
+# while still forgetting a closed tab almost immediately.
+HLS_ACTIVE_SECONDS = int(os.environ.get("HLS_ACTIVE_SECONDS", "30"))
 _hls_lock = threading.Lock()
 _hls_sessions = {}  # go2rtc id -> {"user", "camera", "quality", "metered", "seen"}
 
@@ -654,12 +658,23 @@ def live_hls(camera):
     want_audio = request.args.get("audio") == "1"
     _prune_hls_sessions()
 
-    # Same cap as the MP4 path, counted over live HLS sessions instead of
-    # open connections. Degrade rather than refuse.
+    # Same cap as the MP4 path, but HLS has no connection to count, so it
+    # counts sessions seen very recently instead. The window matters: a
+    # player pulls a segment every half second, so anything still streaming
+    # is seen constantly, while a closed tab stops appearing immediately.
+    # Counting over the full session TTL instead made four expands in five
+    # minutes silently downgrade the fifth to the substream long after
+    # nobody was watching them -- observed while testing.
     if quality == "full":
+        active_since = time.time() - HLS_ACTIVE_SECONDS
         with _hls_lock:
-            active_full = sum(1 for v in _hls_sessions.values() if v["quality"] == "full")
+            active_full = sum(
+                1 for v in _hls_sessions.values()
+                if v["quality"] == "full" and v["seen"] >= active_since
+            )
         if active_full >= MAX_FULL_QUALITY_SESSIONS:
+            log.info("hls full-quality cap reached (%d active); serving substream",
+                     active_full)
             quality = "sub"
 
     src, params = resolve_hls_source(camera, audio_allowed, quality, want_audio)
