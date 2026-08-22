@@ -1,16 +1,25 @@
 # livecam
 
-A thin gate in front of [ZoneMinder](https://zoneminder.com/), which does
-the actual camera recording/live-view/storage/login on the `cameras` VM
-(see the `camera_nvr` role in the ansible repo). This app passes almost
-everything straight through to ZM's own web console untouched, and only
-intercepts stream/clip requests to add two things ZM doesn't support
-natively:
+A thin gate in front of the camera stack on the `cameras` VM (see the
+`camera_nvr` role in the ansible repo), which is split across two backends:
+[ZoneMinder](https://zoneminder.com/) does recording, storage, login and
+recorded playback, while [go2rtc](https://github.com/AlexxIT/go2rtc) serves
+live view by remuxing the camera stream without decoding it. ZM's own live
+path is deliberately unused -- it decodes every frame and pinned the NVR box
+hard enough to need a power cycle.
 
-- A per-user **time-of-day viewing window**, checked on every request (not
-  just at login), for both live streams and recorded clip playback.
-- Real per-user **audio gating** -- the audio track is stripped server-side
-  for users without audio permission, not just muted client-side.
+This app passes almost everything straight through to ZM's web console
+untouched, and only intercepts stream/clip requests to add two things
+neither backend enforces natively:
+
+- A per-user **time-of-day viewing window**, re-checked continuously while a
+  stream is running -- not just at login -- so a window closing mid-view
+  actually cuts the stream off.
+- Real per-user **audio gating**. Live view is served from go2rtc, which
+  publishes a genuinely audio-free variant of each camera, so gating is a
+  matter of which stream gets requested rather than anything this app does
+  to the media. Verified against a live camera: the `_noaudio` track list is
+  video-only, not merely muted.
 
 Camera-level access restriction needs no code here at all -- it's handled
 natively by ZM's own per-user monitor permissions.
@@ -33,7 +42,10 @@ decision):
 
 | Var | Purpose |
 |---|---|
-| `ZM_BACKEND_URL` | Base URL of ZoneMinder on the `cameras` VM |
+| `ZM_BACKEND_URL` | ZoneMinder on the `cameras` VM -- recorded playback only |
+| `GO2RTC_URL` | go2rtc on the `cameras` VM -- live view only |
+| `MAX_FULL_QUALITY_SESSIONS` | Concurrent full-res live viewers before extra ones are served the substream (default 4) |
+| `HEARTBEAT_TIMEOUT_SECONDS` | Live stream is torn down after this long without a heartbeat (default 600) |
 | `ZM_DB_HOST` / `ZM_DB_USER` / `ZM_DB_PASSWORD` / `ZM_DB_NAME` | Read-only access to ZM's own DB, used only to resolve a session cookie to a ZM username |
 | `PERMISSIONS_FILE` | Path to the per-user permission config (default `/app/config/permissions.yml`), see `config/permissions.yml.example` |
 | `FLASK_SECRET_KEY` | Flask session secret |
@@ -55,13 +67,12 @@ real.
 Written without a live ZoneMinder instance to test against this session --
 these are the parts most likely to need adjustment once run for real:
 
-- `MEDIA_PATH_PATTERNS` in `livecam.py` -- the exact URL shape of ZM's live
+- `ZM_MEDIA_PATTERNS` in `livecam.py` -- the exact URL shape of ZM's live
   stream (`nph-zms`) and event-clip endpoints, which is what determines
   whether a request gets gated at all.
 - `resolve_zm_username()` -- the exact format of ZM's `Sessions` table and
   its PHP-serialized session data varies by version; the regex extraction
   here is a best-effort first pass.
-- ZM's Monitor `Function`/Video Writer setting for direct/passthrough
-  recording (configured by the `camera_nvr` ansible role, not this repo) --
-  needs confirming in the ZM web console so recordings stay lightweight
-  stream-copies rather than the legacy per-frame JPEG mode.
+- The client side of the heartbeat isn't written yet -- the server will tear
+  a stream down after `HEARTBEAT_TIMEOUT_SECONDS`, so until a page actually
+  posts to `/api/heartbeat` every live view dies after that timeout.

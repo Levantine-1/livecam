@@ -1,53 +1,72 @@
 """
-livecam -- a thin gate in front of ZoneMinder.
+livecam -- a thin gate in front of the camera stack.
 
-Almost every request is passed straight through to ZM untouched (login page,
-dashboard, monitor list, event browser -- all native ZM UI/UX, including its
-own per-user per-camera restriction). This app only intercepts the two
-things ZM has no native concept of: a per-user time-of-day viewing window,
-and true per-user audio gating (stripping the audio track for users who
-shouldn't get it, rather than a client-side mute).
+Two backends, deliberately split by what each is good at:
 
-ZM itself is never exposed directly to LAN or WAN clients -- only this app
-is (see the `livecam` entry in ansible's VMWareDockerHosts group_vars) --
-so these checks can't be bypassed by hitting ZM's own URL directly.
+  * ZoneMinder  -- recorded playback. It hands over the stored mp4 and the
+                   browser decodes it, so this costs the server nothing.
+  * go2rtc      -- live view. It remuxes the camera's existing H.264 without
+                   decoding, which is why live view is cheap. ZoneMinder's
+                   own live path decodes every frame and is explicitly NOT
+                   used here -- it pinned the NVR box hard enough to need a
+                   power cycle.
+
+Almost every request is passed straight through to ZoneMinder untouched
+(login page, dashboard, event browser -- all native ZM UI, including its
+own per-user per-camera restriction). This app only adds the two things ZM
+has no native concept of: a per-user time-of-day window, and true per-user
+audio gating.
+
+Neither backend is reachable from outside the LAN; only this app is. So the
+permission checks can't be bypassed by hitting go2rtc or ZM directly.
 """
 
 import os
 import re
-import subprocess
+import threading
+import time
 from datetime import datetime, time as dtime
 
 import pymysql
 import requests
 import yaml
-from flask import Flask, Response, request, abort
+from flask import Flask, Response, jsonify, request, abort, stream_with_context
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-only-change-me")
 
 ZM_BACKEND_URL = os.environ["ZM_BACKEND_URL"].rstrip("/")
+GO2RTC_URL = os.environ["GO2RTC_URL"].rstrip("/")
 PERMISSIONS_FILE = os.environ.get("PERMISSIONS_FILE", "/app/config/permissions.yml")
 
-# Read-only access to ZM's own MySQL database, used only to resolve "which
-# ZM user does this session cookie belong to" -- see resolve_zm_username()
-# below. Exact schema/session-serialization details verified against the
-# actual installed ZM version, not assumed here to be exactly right on the
-# first pass.
+# Read-only access to ZM's own database, used only to resolve "which ZM user
+# does this session cookie belong to".
 ZM_DB_HOST = os.environ.get("ZM_DB_HOST")
 ZM_DB_USER = os.environ.get("ZM_DB_USER")
 ZM_DB_PASSWORD = os.environ.get("ZM_DB_PASSWORD")
 ZM_DB_NAME = os.environ.get("ZM_DB_NAME", "zm")
 
-# Paths that carry actual video/audio content -- these are the only ones
-# gated by time-window/audio checks; everything else (login, dashboard,
-# monitor list, event browser chrome) passes through untouched. ZM's
-# streaming CGI is nph-zms; event clip downloads and frame images live
-# under /zm/index.php with a view= query param. Verify these patterns
-# against the actual installed ZM version's URLs before relying on this --
-# flagged in the implementation plan as the one piece most likely to need
-# adjustment once tested live.
-MEDIA_PATH_PATTERNS = (
+# A full-resolution viewer costs ~7 Mbps (~2.95 GB/hour). Past this many
+# concurrent live sessions the home uplink, not the CPU, becomes the limit
+# -- roughly 70 Mbps at ten viewers, more than many connections have. Rather
+# than let a spike stutter for everyone, extra viewers are served the
+# substream (~0.62 Mbps), which go2rtc already publishes.
+MAX_FULL_QUALITY_SESSIONS = int(os.environ.get("MAX_FULL_QUALITY_SESSIONS", "4"))
+
+# An abandoned tab is the real cost risk, not active watching: left running
+# overnight one stream is ~35 GB. The browser pings /api/heartbeat while the
+# viewer is actually present; once pings stop the stream is torn down
+# server-side, so closing a laptop lid ends the transfer rather than merely
+# stopping the prompt.
+HEARTBEAT_TIMEOUT_SECONDS = int(os.environ.get("HEARTBEAT_TIMEOUT_SECONDS", "600"))
+
+_sessions_lock = threading.Lock()
+_live_sessions = {}  # stream_token -> last heartbeat epoch
+
+# Only these carry actual video/audio. Everything else passes through to ZM
+# untouched. Verify against the installed ZM version -- these were written
+# without a live ZM to test against.
+ZM_MEDIA_PATTERNS = (
     re.compile(r"/zm/cgi-bin/nph-zms"),
     re.compile(r"/zm/index\.php.*view=(image|video)"),
 )
@@ -59,16 +78,12 @@ def load_permissions():
 
 
 def resolve_zm_username(session_cookie):
-    """Look up which ZM user a forwarded session cookie belongs to.
+    """Resolve a forwarded ZM session cookie to a username.
 
-    Queries ZM's own Sessions table directly (colocated on the same LAN)
-    rather than trying to call one of ZM's own API endpoints with the
-    forwarded cookie -- simpler and doesn't depend on guessing the right
-    unauthenticated-but-session-aware API route. ZM's session data is a
-    PHP-serialized blob; this does a best-effort regex extraction of the
-    username field rather than a full PHP unserialize (no good stdlib
-    option in Python) -- verify this still matches the real stored format
-    on the installed ZM version.
+    Queries ZM's Sessions table directly rather than round-tripping through
+    ZM's API. The session blob is PHP-serialized; this does a best-effort
+    regex extraction. Unverified against a live ZM -- confirm the stored
+    format before trusting it.
     """
     if not session_cookie:
         return None
@@ -91,11 +106,10 @@ def resolve_zm_username(session_cookie):
 
 
 def check_permission(username, permissions, now=None):
-    """Return (camera_names_allowed, audio_allowed) for this user right now.
+    """Return (allowed_cameras, audio_allowed) for this user right now.
 
-    Time window is checked here, not just at login, so a lapsed grant
-    actually cuts off access mid-session -- both for live streams and for
-    browsing footage recorded outside the window.
+    The time window is evaluated per request, not once at login, so a lapsed
+    grant actually cuts a stream off mid-session.
     """
     now = now or datetime.now()
     user_perms = permissions.get(username)
@@ -112,44 +126,107 @@ def check_permission(username, permissions, now=None):
     return set(user_perms.get("cameras", [])), bool(user_perms.get("audio", False))
 
 
-def is_media_path(path):
-    return any(p.search(path) for p in MEDIA_PATH_PATTERNS)
+def _prune_stale_sessions():
+    cutoff = time.time() - HEARTBEAT_TIMEOUT_SECONDS
+    with _sessions_lock:
+        for token in [t for t, seen in _live_sessions.items() if seen < cutoff]:
+            del _live_sessions[token]
+        return len(_live_sessions)
 
 
-def strip_audio(content, content_type):
-    """Cheap `-an` remux -- no video re-encode, just drops the audio track."""
-    proc = subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", "pipe:0",
-            "-c:v", "copy", "-an",
-            "-f", _format_for(content_type),
-            "pipe:1",
-        ],
-        input=content,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+def resolve_stream_name(camera, audio_allowed, use_substream):
+    """Map (camera, permissions, load) onto one of go2rtc's stream names.
+
+    Audio gating is enforced by *which stream is requested*: the `_noaudio`
+    variants are published by go2rtc with the audio track genuinely removed
+    (verified against a live camera -- the track list is video-only, not
+    merely muted), so a user without audio permission cannot receive audio
+    even if they tamper with the client.
+    """
+    name = camera
+    if use_substream:
+        name += "_sub"
+    if not audio_allowed:
+        name += "_noaudio"
+    return name
+
+
+@app.route("/api/heartbeat", methods=["POST"])
+def heartbeat():
+    """Keeps a live session alive; stops being called when the viewer goes away."""
+    token = request.json.get("token") if request.is_json else None
+    if not token:
+        abort(400)
+    with _sessions_lock:
+        if token in _live_sessions:
+            _live_sessions[token] = time.time()
+    return jsonify({"ok": True})
+
+
+@app.route("/live/<camera>")
+def live(camera):
+    session_cookie = request.cookies.get("ZMSESSID")
+    username = resolve_zm_username(session_cookie)
+    if not username:
+        abort(401)
+
+    permissions = load_permissions()
+    allowed_cameras, audio_allowed = check_permission(username, permissions)
+    if camera not in allowed_cameras:
+        abort(403)
+
+    active = _prune_stale_sessions()
+    use_substream = active >= MAX_FULL_QUALITY_SESSIONS
+    stream = resolve_stream_name(camera, audio_allowed, use_substream)
+
+    token = f"{username}:{camera}:{time.time()}"
+    with _sessions_lock:
+        _live_sessions[token] = time.time()
+
+    upstream = requests.get(
+        f"{GO2RTC_URL}/api/stream.mp4",
+        params={"src": stream},
+        stream=True,
+        timeout=15,
     )
-    return proc.stdout
 
+    def pump():
+        try:
+            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                # Re-check both the heartbeat and the time window on every
+                # chunk, so an abandoned tab or a window that closes mid-view
+                # actually stops the transfer rather than running until the
+                # client disconnects.
+                with _sessions_lock:
+                    last_seen = _live_sessions.get(token)
+                if last_seen is None or time.time() - last_seen > HEARTBEAT_TIMEOUT_SECONDS:
+                    break
+                still_allowed, _ = check_permission(username, load_permissions())
+                if camera not in still_allowed:
+                    break
+                yield chunk
+        finally:
+            upstream.close()
+            with _sessions_lock:
+                _live_sessions.pop(token, None)
 
-def _format_for(content_type):
-    # Extend as needed once tested against ZM's actual served content-types
-    # for live streams vs event clip downloads.
-    return "mp4" if "mp4" in (content_type or "") else "matroska"
+    resp = Response(stream_with_context(pump()), content_type="video/mp4")
+    resp.headers["X-Livecam-Stream"] = stream
+    resp.headers["X-Livecam-Session"] = token
+    return resp
 
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
 @app.route("/<path:path>", methods=["GET", "POST"])
 def gate(path):
+    """Everything else: ZoneMinder, with recorded media gated the same way."""
     full_path = "/" + path
     upstream_url = ZM_BACKEND_URL + full_path
 
-    if not is_media_path(full_path):
-        # Not a stream/clip request -- pass straight through untouched.
+    if not any(p.search(full_path) for p in ZM_MEDIA_PATTERNS):
         return _proxy(upstream_url)
 
-    session_cookie = request.cookies.get("ZMSESSID")
-    username = resolve_zm_username(session_cookie)
+    username = resolve_zm_username(request.cookies.get("ZMSESSID"))
     if not username:
         abort(401)
 
@@ -161,16 +238,17 @@ def gate(path):
     if camera_name not in allowed_cameras:
         abort(403)
 
-    resp = _proxy(upstream_url, return_response=True)
+    # Recorded events are muxed by ZoneMinder with whatever the camera sent,
+    # so audio can't be selected away the way it is for live. Users without
+    # audio permission are refused recorded playback rather than handed a
+    # stream they shouldn't hear -- deliberately failing closed.
+    if not audio_allowed:
+        abort(403)
 
-    if not audio_allowed and resp.status_code == 200:
-        stripped = strip_audio(resp.content, resp.headers.get("Content-Type"))
-        return Response(stripped, status=resp.status_code, content_type=resp.headers.get("Content-Type"))
-
-    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type"))
+    return _proxy(upstream_url)
 
 
-def _proxy(upstream_url, return_response=False):
+def _proxy(upstream_url):
     upstream = requests.request(
         method=request.method,
         url=upstream_url,
@@ -179,13 +257,9 @@ def _proxy(upstream_url, return_response=False):
         data=request.get_data(),
         cookies=request.cookies,
         allow_redirects=False,
-        stream=not return_response,
     )
-    if return_response:
-        return upstream
-
-    excluded_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
-    headers = [(k, v) for k, v in upstream.raw.headers.items() if k.lower() not in excluded_headers]
+    excluded = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+    headers = [(k, v) for k, v in upstream.raw.headers.items() if k.lower() not in excluded]
     return Response(upstream.content, upstream.status_code, headers)
 
 
