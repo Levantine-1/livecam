@@ -23,6 +23,7 @@ permission checks can't be bypassed by hitting go2rtc or ZM directly.
 
 import os
 import re
+import logging
 import secrets
 import threading
 import time
@@ -35,6 +36,8 @@ from flask import (Flask, Response, abort, jsonify, redirect, render_template,
                    request, stream_with_context)
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("livecam")
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-only-change-me")
 
 ZM_BACKEND_URL = os.environ["ZM_BACKEND_URL"].rstrip("/")
@@ -210,7 +213,11 @@ def live(camera):
         timeout=15,
     )
 
+    log.info("live start camera=%s stream=%s user=%s", camera, stream, username)
+
     def pump():
+        sent = 0
+        why = "client disconnected"
         try:
             for chunk in upstream.iter_content(chunk_size=64 * 1024):
                 # Re-checked per chunk so an abandoned tab, or a viewing
@@ -219,13 +226,17 @@ def live(camera):
                 with _sessions_lock:
                     last_seen = _live_sessions.get(token)
                 if last_seen is None or time.time() - last_seen > HEARTBEAT_TIMEOUT_SECONDS:
+                    why = "heartbeat expired"
                     break
                 still_allowed, _ = check_permission(username, load_permissions())
                 if camera not in still_allowed:
+                    why = "permission revoked"
                     break
+                sent += len(chunk)
                 yield chunk
         finally:
             upstream.close()
+            log.info("live end camera=%s reason=%s bytes=%d", camera, why, sent)
 
     resp = Response(stream_with_context(pump()), content_type="video/mp4")
     resp.headers["X-Livecam-Stream"] = stream

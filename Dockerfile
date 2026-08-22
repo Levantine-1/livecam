@@ -42,4 +42,6 @@ CMD ["gunicorn", "livecam:app", \
      "--worker-class", "gthread", \
      "--workers", "2", \
      "--threads", "32", \
-     "--timeout", "0"]
+     "--timeout", "0", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-"]
