@@ -23,6 +23,7 @@ permission checks can't be bypassed by hitting go2rtc or ZM directly.
 
 import os
 import re
+import secrets
 import threading
 import time
 from datetime import datetime, time as dtime
@@ -30,7 +31,8 @@ from datetime import datetime, time as dtime
 import pymysql
 import requests
 import yaml
-from flask import Flask, Response, jsonify, request, abort, stream_with_context
+from flask import (Flask, Response, abort, jsonify, redirect, render_template,
+                   request, stream_with_context)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-only-change-me")
@@ -59,6 +61,12 @@ MAX_FULL_QUALITY_SESSIONS = int(os.environ.get("MAX_FULL_QUALITY_SESSIONS", "4")
 # server-side, so closing a laptop lid ends the transfer rather than merely
 # stopping the prompt.
 HEARTBEAT_TIMEOUT_SECONDS = int(os.environ.get("HEARTBEAT_TIMEOUT_SECONDS", "600"))
+
+# How long a viewer can be idle before the page stops streaming and asks
+# whether they are still watching. Slightly under the server-side timeout so
+# the browser gives up first and the teardown is graceful rather than the
+# stream being cut mid-request.
+IDLE_PROMPT_SECONDS = int(os.environ.get("IDLE_PROMPT_SECONDS", str(max(60, HEARTBEAT_TIMEOUT_SECONDS - 120))))
 
 _sessions_lock = threading.Lock()
 _live_sessions = {}  # stream_token -> last heartbeat epoch
@@ -175,13 +183,18 @@ def live(camera):
     if camera not in allowed_cameras:
         abort(403)
 
-    active = _prune_stale_sessions()
-    use_substream = active >= MAX_FULL_QUALITY_SESSIONS
-    stream = resolve_stream_name(camera, audio_allowed, use_substream)
-
-    token = f"{username}:{camera}:{time.time()}"
+    # The token is issued by the dashboard so the page has something to
+    # heartbeat against. Minting one here per request would leave the
+    # browser unable to keep its own stream alive.
+    token = request.args.get("token")
     with _sessions_lock:
-        _live_sessions[token] = time.time()
+        known = token in _live_sessions
+    if not token or not known:
+        abort(403)
+
+    active = _prune_stale_sessions()
+    stream = resolve_stream_name(camera, audio_allowed,
+                                 active > MAX_FULL_QUALITY_SESSIONS)
 
     upstream = requests.get(
         f"{GO2RTC_URL}/api/stream.mp4",
@@ -193,10 +206,9 @@ def live(camera):
     def pump():
         try:
             for chunk in upstream.iter_content(chunk_size=64 * 1024):
-                # Re-check both the heartbeat and the time window on every
-                # chunk, so an abandoned tab or a window that closes mid-view
-                # actually stops the transfer rather than running until the
-                # client disconnects.
+                # Re-checked per chunk so an abandoned tab, or a viewing
+                # window that closes mid-stream, actually stops the transfer
+                # instead of running until the client disconnects.
                 with _sessions_lock:
                     last_seen = _live_sessions.get(token)
                 if last_seen is None or time.time() - last_seen > HEARTBEAT_TIMEOUT_SECONDS:
@@ -207,16 +219,45 @@ def live(camera):
                 yield chunk
         finally:
             upstream.close()
-            with _sessions_lock:
-                _live_sessions.pop(token, None)
 
     resp = Response(stream_with_context(pump()), content_type="video/mp4")
     resp.headers["X-Livecam-Stream"] = stream
-    resp.headers["X-Livecam-Session"] = token
     return resp
 
 
-@app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
+@app.route("/")
+def dashboard():
+    """livecam's own landing page: the permitted cameras, live.
+
+    Previously "/" fell through to the catch-all proxy, which forwarded it
+    to the cameras VM's Apache root -- ZoneMinder lives under /zm/, so that
+    served Apache's default page instead of anything useful.
+    """
+    username = resolve_zm_username(request.cookies.get("ZMSESSID"))
+    if not username:
+        # Not logged in: hand off to ZoneMinder's own login, which is the
+        # only account system here.
+        return redirect("/zm/")
+
+    permissions = load_permissions()
+    allowed_cameras, audio_allowed = check_permission(username, permissions)
+
+    token = secrets.token_urlsafe(24)
+    with _sessions_lock:
+        _live_sessions[token] = time.time()
+    active = _prune_stale_sessions()
+
+    return render_template(
+        "index.html",
+        username=username,
+        cameras=sorted(allowed_cameras),
+        audio_allowed=audio_allowed,
+        substream=active > MAX_FULL_QUALITY_SESSIONS,
+        token=token,
+        idle_prompt_seconds=IDLE_PROMPT_SECONDS,
+    )
+
+
 @app.route("/<path:path>", methods=["GET", "POST"])
 def gate(path):
     """Everything else: ZoneMinder, with recorded media gated the same way."""

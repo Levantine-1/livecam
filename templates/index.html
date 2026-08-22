@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>livecam</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#14161a; color:#e8eaed; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:1rem; padding:.75rem 1rem; background:#1c1f26; border-bottom:1px solid #2a2f3a; }
+  header h1 { font-size:1rem; margin:0; font-weight:600; letter-spacing:.02em; }
+  header .who { color:#9aa3b2; font-size:.85rem; }
+  header a { margin-left:auto; color:#7db3ff; text-decoration:none; font-size:.85rem; }
+  .grid { display:grid; gap:1rem; padding:1rem; grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr)); }
+  figure { margin:0; background:#1c1f26; border:1px solid #2a2f3a; border-radius:8px; overflow:hidden; }
+  figure video { width:100%; display:block; background:#000; aspect-ratio:16/9; object-fit:contain; }
+  figcaption { display:flex; align-items:center; gap:.5rem; padding:.5rem .75rem; font-size:.9rem; }
+  .badge { font-size:.7rem; padding:.1rem .4rem; border-radius:4px; background:#2a2f3a; color:#9aa3b2; }
+  .empty { padding:2rem 1rem; color:#9aa3b2; }
+  dialog { border:1px solid #2a2f3a; background:#1c1f26; color:#e8eaed; border-radius:8px; padding:1.25rem; }
+  dialog button { margin-top:1rem; padding:.5rem 1rem; border-radius:6px; border:0; background:#2f6fd0; color:#fff; font-size:1rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>livecam</h1>
+  <span class="who">{{ username }}</span>
+  <a href="/zm/">recordings &amp; settings &rarr;</a>
+</header>
+
+{% if cameras %}
+<div class="grid">
+  {% for cam in cameras %}
+  <figure>
+    <video src="/live/{{ cam }}?token={{ token }}" autoplay muted playsinline preload="none"></video>
+    <figcaption>
+      {{ cam }}
+      <span class="badge">{{ 'audio' if audio_allowed else 'no audio' }}</span>
+      {% if substream %}<span class="badge">reduced quality</span>{% endif %}
+    </figcaption>
+  </figure>
+  {% endfor %}
+</div>
+{% else %}
+<p class="empty">No cameras are available to you right now. This can mean none are assigned to your account, or you're outside your permitted viewing hours.</p>
+{% endif %}
+
+<dialog id="idle">
+  <strong>Still watching?</strong>
+  <p>Streaming paused to avoid using bandwidth in the background.</p>
+  <button id="resume">Resume</button>
+</dialog>
+
+<script>
+// Streams are torn down server-side when heartbeats stop, so an abandoned
+// tab stops transferring rather than running until the browser is closed.
+// A full-resolution viewer costs roughly 2.95 GB/hour.
+const TOKEN = {{ token | tojson }};
+const IDLE_MS = {{ idle_prompt_seconds }} * 1000;
+const BEAT_MS = 60000;
+
+let lastActive = Date.now();
+let beat = null;
+const dlg = document.getElementById('idle');
+
+['mousemove','keydown','click','touchstart','scroll'].forEach(
+  e => addEventListener(e, () => { lastActive = Date.now(); }, {passive:true}));
+
+async function sendBeat() {
+  if (Date.now() - lastActive > IDLE_MS) return pause();
+  // Pause while the tab is hidden too -- a backgrounded tab is still
+  // pulling video otherwise.
+  if (document.hidden) return;
+  try {
+    await fetch('/api/heartbeat', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({token: TOKEN})
+    });
+  } catch (e) { /* transient; next beat retries */ }
+}
+
+function pause() {
+  clearInterval(beat); beat = null;
+  document.querySelectorAll('video').forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); });
+  if (!dlg.open) dlg.showModal();
+}
+
+document.getElementById('resume').addEventListener('click', () => {
+  dlg.close(); lastActive = Date.now(); location.reload();
+});
+
+sendBeat();
+beat = setInterval(sendBeat, BEAT_MS);
+</script>
+</body>
+</html>
