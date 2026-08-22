@@ -1,0 +1,129 @@
+name: Deploy to ECR
+
+on:
+  push:
+    branches:
+     - 'master'
+
+env:
+  service_name: livecam
+  url: 'https://livecam.levantine.io'
+
+jobs:
+  run_terraform:
+    name: Apply Terraform Templates
+    # self-hosted, not ubuntu-latest: this repo's terraform reaches Vault
+    # directly (for the delegate-zone record's credentials), which isn't
+    # reachable from a GitHub-hosted runner, only from inside the homelab
+    # network.
+    runs-on: self-hosted
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::975050308029:role/github_actions_livecam
+          aws-region: us-west-2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: terraform
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -var-file=vars/production.tfvars -var "vault_token=${VAULT_TOKEN}"
+        working-directory: terraform
+        env:
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+
+  build_and_push_container:
+    name: Build and Push Container to ECR
+    needs: run_terraform
+    runs-on: ubuntu-latest
+    steps:
+     - name: Check out code
+       uses: actions/checkout@v4
+
+     - name: Configure AWS credentials
+       uses: aws-actions/configure-aws-credentials@v4
+       with:
+         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+         aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+         aws-region: us-west-2
+
+     - name: Login to Amazon ECR
+       id: login-ecr
+       uses: aws-actions/amazon-ecr-login@v2
+
+     - name: Build, tag, and push image to Amazon ECR
+       env:
+         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+         ECR_REPOSITORY: ${{ env.service_name }}
+         IMAGE_TAG: ${{ env.service_name }}-image-${{github.run_number}}
+       run: |
+         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+  deploy_container:
+    name: Trigger Deploy via Semaphore
+    # self-hosted: Semaphore is only reachable from inside the homelab
+    # network, matching thisper's equivalent job.
+    runs-on: self-hosted
+    needs: build_and_push_container
+    steps:
+      - name: Trigger "Deploy Container" Semaphore template
+        env:
+          SEMAPHORE_URL: http://service.internal.levantine.io:3000
+          SEMAPHORE_API_TOKEN: ${{ secrets.SEMAPHORE_API_TOKEN }}
+          CONTAINER_NAME: ${{ env.service_name }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, time, urllib.request
+
+          url = os.environ["SEMAPHORE_URL"]
+          token = os.environ["SEMAPHORE_API_TOKEN"]
+          container_name = os.environ["CONTAINER_NAME"]
+          headers = {"Authorization": f"Bearer {token}"}
+
+          def get(path):
+              req = urllib.request.Request(f"{url}{path}", headers=headers)
+              return json.load(urllib.request.urlopen(req))
+
+          project_id = next(p["id"] for p in get("/api/projects") if p["name"] == "Homelab Ops")
+          template_id = next(t["id"] for t in get(f"/api/project/{project_id}/templates") if t["name"] == "Deploy Container")
+
+          body = json.dumps({
+              "template_id": template_id,
+              "environment": json.dumps({"container_name": container_name}),
+          }).encode()
+          req = urllib.request.Request(
+              f"{url}/api/project/{project_id}/tasks",
+              data=body,
+              headers={**headers, "Content-Type": "application/json"},
+              method="POST",
+          )
+          task_id = json.load(urllib.request.urlopen(req))["id"]
+          print(f"Triggered Semaphore task {task_id} for template {template_id} (container_name={container_name})")
+
+          for _ in range(60):
+              status = get(f"/api/project/{project_id}/tasks/{task_id}")["status"]
+              print(f"Status: {status}")
+              if status == "success":
+                  sys.exit(0)
+              if status in ("error", "stopped"):
+                  print("Semaphore task failed")
+                  sys.exit(1)
+              time.sleep(10)
+
+          print("Timed out waiting for Semaphore task to finish")
+          sys.exit(1)
+          PYEOF

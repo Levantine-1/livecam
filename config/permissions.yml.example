@@ -1,0 +1,25 @@
+# Admin-edited directly -- copy to permissions.yml and fill in real ZM
+# usernames. No UI for this; it's a handful of users, not worth building one.
+#
+# _monitor_id_to_name maps ZM's numeric Monitor IDs (assigned when each
+# Monitor is created, see ansible/roles/applications/camera_nvr) to the
+# camera names used in each user's `cameras` list below.
+_monitor_id_to_name:
+  1: guinea-pig-cage-1
+  2: guinea-pig-cage-2
+
+# Example user -- full access, all hours.
+alice:
+  cameras:
+    - guinea-pig-cage-1
+    - guinea-pig-cage-2
+  audio: true
+
+# Example user -- one camera, no audio, daytime only.
+bob:
+  cameras:
+    - guinea-pig-cage-1
+  audio: false
+  time_window:
+    start: "08:00:00"
+    end: "20:00:00"

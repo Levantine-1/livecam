@@ -1,0 +1,8 @@
+/terraform/.terraform/
+/terraform/.terraform.lock.hcl
+/terraform/terraform.tfstate
+/terraform/terraform.tfstate.backup
+config/permissions.yml
+__pycache__/
+*.pyc
+.idea/
