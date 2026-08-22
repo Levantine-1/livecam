@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>livecam &mdash; sign in</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#14161a; color:#e8eaed;
+         font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  form { width:min(100%,340px); margin:1rem; padding:1.5rem; background:#1c1f26;
+         border:1px solid #2a2f3a; border-radius:10px; }
+  h1 { margin:0 0 1.25rem; font-size:1.1rem; font-weight:600; letter-spacing:.02em; }
+  label { display:block; margin-bottom:.9rem; font-size:.85rem; color:#9aa3b2; }
+  input { display:block; width:100%; box-sizing:border-box; margin-top:.35rem;
+          padding:.6rem .7rem; font-size:1rem; color:#e8eaed; background:#14161a;
+          border:1px solid #2a2f3a; border-radius:6px; }
+  input:focus { outline:2px solid #2f6fd0; outline-offset:1px; border-color:#2f6fd0; }
+  button { width:100%; margin-top:.35rem; padding:.65rem 1rem; font-size:1rem;
+           border:0; border-radius:6px; background:#2f6fd0; color:#fff; cursor:pointer; }
+  button:hover { background:#3b7ee4; }
+  .error { margin:0 0 1rem; padding:.55rem .7rem; border-radius:6px; font-size:.85rem;
+           background:#3a1e22; border:1px solid #5c2b31; color:#ffb4bb; }
+</style>
+</head>
+<body>
+<form method="post" action="{{ url_for('login') }}">
+  <h1>livecam</h1>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <input type="hidden" name="next" value="{{ next }}">
+  <label>Username
+    <!-- autofocus plus autocomplete hints so password managers on phones
+         fill this the way they fill any other login. -->
+    <input name="username" autocomplete="username" autocapitalize="none"
+           autocorrect="off" spellcheck="false" autofocus required>
+  </label>
+  <label>Password
+    <input name="password" type="password" autocomplete="current-password" required>
+  </label>
+  <button type="submit">Sign in</button>
+</form>
+</body>
+</html>

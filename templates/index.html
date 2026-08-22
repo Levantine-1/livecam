@@ -10,7 +10,23 @@
   header { display:flex; align-items:center; gap:1rem; padding:.75rem 1rem; background:#1c1f26; border-bottom:1px solid #2a2f3a; }
   header h1 { font-size:1rem; margin:0; font-weight:600; letter-spacing:.02em; }
   header .who { color:#9aa3b2; font-size:.85rem; }
-  header a { margin-left:auto; color:#7db3ff; text-decoration:none; font-size:.85rem; }
+  header a { color:#7db3ff; text-decoration:none; font-size:.85rem; }
+  header .spacer { margin-left:auto; }
+  .banner { display:flex; flex-wrap:wrap; align-items:center; gap:.75rem;
+            padding:.7rem 1rem; background:#1f2a19; border-bottom:1px solid #3a4c2e;
+            font-size:.9rem; color:#dcecc9; }
+  .banner a { color:#a8e06a; font-weight:600; }
+  .banner button { margin-left:auto; background:transparent; border:1px solid #3a4c2e;
+                   color:#9aa3b2; border-radius:6px; padding:.25rem .6rem;
+                   font-size:.8rem; cursor:pointer; }
+  .banner[hidden] { display:none; }
+  .usage { padding:.6rem 1rem; font-size:.8rem; color:#9aa3b2;
+           border-bottom:1px solid #2a2f3a; }
+  .usage .bar { height:5px; margin-top:.4rem; border-radius:3px; background:#2a2f3a;
+                overflow:hidden; }
+  .usage .bar span { display:block; height:100%; background:#4f8ede; }
+  .usage .bar span.high { background:#d08b2f; }
+  .usage .bar span.over { background:#d0552f; }
   .grid { display:grid; gap:1rem; padding:1rem; grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr)); }
   figure { margin:0; background:#1c1f26; border:1px solid #2a2f3a; border-radius:8px; overflow:hidden; cursor:pointer; }
   figure:hover { border-color:#3d4757; }
@@ -35,8 +51,35 @@
 <header>
   <h1>livecam</h1>
   <span class="who">{{ username }}</span>
+  <span class="spacer"></span>
   <a href="/zm/">recordings &amp; settings &rarr;</a>
+  <a href="{{ url_for('logout') }}">sign out</a>
 </header>
+
+{% if show_home_banner %}
+<!-- Only rendered on the public hostname. Reaching the house from outside
+     goes out to AWS and back down the home uplink, so watching from the
+     sofa on this URL pays for a round trip to Oregon that the LAN link
+     avoids entirely. -->
+<div class="banner" id="homeBanner" hidden>
+  <span>
+    At home? Use <a href="{{ lan_url }}">{{ lan_hostname }}</a> instead &mdash;
+    it stays on your home network, so it is faster and costs nothing.
+    This address routes through AWS and counts against the data allowance below.
+  </span>
+  <button type="button" id="dismissBanner">Dismiss</button>
+</div>
+{% endif %}
+
+<!-- Deliberately labelled "camera traffic", not "AWS egress": this counts
+     only what this app served over the public hostname. Other services on
+     the host egress too, so the real bill is at least this. Video dwarfs
+     everything else here, which is what makes the number worth showing. -->
+<div class="usage" id="usage"
+     data-bytes="{{ egress_bytes }}" data-free="{{ free_tier_bytes }}">
+  <span id="usageText">&mdash;</span>
+  <div class="bar"><span id="usageBar" style="width:0"></span></div>
+</div>
 
 {% if cameras %}
 <div class="grid" id="grid">
@@ -174,9 +217,57 @@ document.getElementById('resume').addEventListener('click', () => {
   dlg.close(); lastActive = Date.now(); location.reload();
 });
 
+// Dismissal is remembered per browser so the banner informs once rather
+// than nagging every visit. Keyed by hostname so dismissing it on a phone
+// away from home doesn't also hide it later at home on a different device.
+const banner = document.getElementById('homeBanner');
+if (banner) {
+  const KEY = 'livecam.homeBanner.dismissed.' + location.hostname;
+  let dismissed = false;
+  try { dismissed = localStorage.getItem(KEY) === '1'; } catch (e) { /* private mode */ }
+  banner.hidden = dismissed;
+  document.getElementById('dismissBanner').addEventListener('click', () => {
+    banner.hidden = true;
+    try { localStorage.setItem(KEY, '1'); } catch (e) { /* nothing to do */ }
+  });
+}
+
+const usageEl = document.getElementById('usage');
+const usageText = document.getElementById('usageText');
+const usageBar = document.getElementById('usageBar');
+const FREE_BYTES = Number(usageEl.dataset.free);
+
+const fmtBytes = b => {
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0, n = Number(b);
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n < 10 && i > 0 ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
+};
+
+function renderUsage(bytes) {
+  const pct = FREE_BYTES > 0 ? (bytes / FREE_BYTES) * 100 : 0;
+  usageText.textContent =
+    `Camera traffic via AWS this month: ${fmtBytes(bytes)} of ${fmtBytes(FREE_BYTES)} free `
+    + `(${pct < 0.1 && bytes > 0 ? '<0.1' : pct.toFixed(1)}%). Watching at home doesn't count.`;
+  usageBar.style.width = Math.min(pct, 100).toFixed(2) + '%';
+  usageBar.className = pct >= 100 ? 'over' : pct >= 80 ? 'high' : '';
+}
+
+renderUsage(Number(usageEl.dataset.bytes));
+
+// Refreshed on the heartbeat interval rather than continuously -- the
+// number only moves while someone is streaming, and they are the one
+// looking at it.
+async function refreshUsage() {
+  try {
+    const r = await fetch('/api/usage');
+    if (r.ok) renderUsage((await r.json()).bytes);
+  } catch (e) { /* transient; next beat retries */ }
+}
+
 startTiles();
 sendBeat();
-beat = setInterval(sendBeat, BEAT_MS);
+beat = setInterval(() => { sendBeat(); refreshUsage(); }, BEAT_MS);
 </script>
 </body>
 </html>
