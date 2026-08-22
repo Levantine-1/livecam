@@ -45,7 +45,7 @@
     <video data-camera="{{ cam }}" autoplay muted playsinline preload="none"></video>
     <figcaption>
       {{ cam }}
-      <span class="badge">preview</span>
+      <span class="badge res">&mdash;</span>
       <span class="hint">click for full quality</span>
     </figcaption>
   </figure>
@@ -58,7 +58,8 @@
 <div id="overlay" hidden>
   <div class="bar">
     <strong id="overlayName"></strong>
-    <span class="badge">full quality{{ ' + audio' if audio_allowed else '' }}</span>
+    <span class="badge" id="overlayRes">&mdash;</span>
+    <span class="badge">{{ 'audio' if audio_allowed else 'no audio' }}</span>
     <button id="closeBtn" type="button">Close (Esc)</button>
   </div>
   <video id="overlayVideo" autoplay playsinline{{ '' if audio_allowed else ' muted' }}></video>
@@ -89,6 +90,24 @@ const dlg = document.getElementById('idle');
 const src = (cam, q) => `/live/${encodeURIComponent(cam)}?token=${encodeURIComponent(TOKEN)}&quality=${q}`;
 
 function stopVideo(v) { v.pause(); v.removeAttribute('src'); v.load(); }
+
+// Show the resolution the browser actually decoded. Tiles should read
+// 704x480 (the camera's substream) and the expanded view 2960x1668 -- at
+// tile size the two look identical, which is the point, so this makes the
+// difference checkable without opening devtools.
+function showRes(v, el) {
+  const paint = () => {
+    el.textContent = v.videoWidth ? `${v.videoWidth}\u00d7${v.videoHeight}` : '\u2014';
+  };
+  v.addEventListener('loadedmetadata', paint);
+  v.addEventListener('resize', paint);
+  v.addEventListener('emptied', () => { el.textContent = '\u2014'; });
+  paint();
+}
+
+tiles.forEach(v => showRes(v, v.closest('figure').querySelector('.res')));
+
+showRes(overlayVideo, document.getElementById('overlayRes'));
 
 function startTiles() { tiles.forEach(v => { v.src = src(v.dataset.camera, 'sub'); }); }
 // Stopping the tiles matters: otherwise an expanded view costs the full
