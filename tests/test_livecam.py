@@ -126,6 +126,21 @@ def main():
     check("home banner absent on the LAN hostname",
           'id="homeBanner"' not in r.get_data(as_text=True))
 
+    # Regression guard. preload="none" on the tiles is a data-saving hint that
+    # mobile Chrome honours far more literally than desktop: tiles painted one
+    # frame and stopped, while the expanded view worked on the same phone
+    # because a tap always precedes it. Checked against the <video> tags only,
+    # so the explanatory comment does not satisfy it.
+    tags = re.findall(r"<video[^>]*>", page)
+    tile_tags = [t for t in tags if "data-camera" in t]
+    check("tiles exist to check", len(tile_tags) == 2, len(tile_tags))
+    check("tiles do not carry preload=none",
+          all("preload" not in t for t in tile_tags), tile_tags[:1])
+    check("tiles are muted and inline, so autoplay is permitted at all",
+          all("muted" in t and "playsinline" in t for t in tile_tags), tile_tags[:1])
+    check("the tap-to-play fallback exists for when autoplay is refused",
+          'id="tapToPlay"' in page)
+
     perms = livecam.load_permissions()
     allowed, audio = livecam.check_permission("admin", perms)
     check("admin: both cameras, audio on",

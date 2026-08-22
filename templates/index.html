@@ -53,6 +53,10 @@
   #gain { width:90px; }
   .notice { padding:.5rem 1rem; font-size:.8rem; background:#3a2f19; color:#f0d9a8; }
   .notice[hidden] { display:none; }
+  .tap[hidden] { display:none; }
+  .tap { display:block; width:calc(100% - 2rem); margin:1rem; padding:.9rem 1rem;
+         border:0; border-radius:8px; background:#2f6fd0; color:#fff;
+         font-size:1rem; font-weight:600; cursor:pointer; }
 </style>
 </head>
 <body>
@@ -89,11 +93,24 @@
   <div class="bar"><span id="usageBar" style="width:0"></span></div>
 </div>
 
+<!-- Only ever shown if the browser actually refused to start playback, so on
+     a machine where autoplay works nobody sees it. -->
+<button class="tap" id="tapToPlay" type="button" hidden>
+  Tap to start the live view
+</button>
+
 {% if cameras %}
 <div class="grid" id="grid">
   {% for cam in cameras %}
   <figure data-camera="{{ cam }}" tabindex="0">
-    <video data-camera="{{ cam }}" autoplay muted playsinline preload="none"></video>
+    <!-- No preload="none" here. It used to be, as a bandwidth guard, but it
+         is a data-saving *hint* that mobile Chrome honours far more literally
+         than desktop: the tile loaded metadata, painted one frame and stopped,
+         while the expanded view worked on the same phone because a tap always
+         precedes it. The stream is only fetched when src is set anyway, which
+         is what actually controls the bandwidth. -->
+    <video data-camera="{{ cam }}" autoplay muted playsinline
+           disablepictureinpicture disableremoteplayback></video>
     <figcaption>
       {{ cam }}
       <span class="badge res">&mdash;</span>
@@ -156,6 +173,7 @@ const overlay = document.getElementById('overlay');
 const overlayVideo = document.getElementById('overlayVideo');
 const overlayName = document.getElementById('overlayName');
 const dlg = document.getElementById('idle');
+const tapToPlay = document.getElementById('tapToPlay');
 
 const AUDIO_ALLOWED = {{ audio_allowed | tojson }};
 
@@ -190,7 +208,30 @@ tiles.forEach(v => showRes(v, v.closest('figure').querySelector('.res')));
 
 showRes(overlayVideo, document.getElementById('overlayRes'));
 
-function startTiles() { tiles.forEach(v => { v.src = src(v.dataset.camera, 'sub'); }); }
+// play() returns a promise that *rejects* when a browser declines to start,
+// and an unhandled rejection is invisible -- which is how a blocked tile
+// ends up looking like a still image with nothing in the console. Autoplay
+// rules differ by platform and by how much the user has interacted with the
+// site, so the only reliable approach is to ask, then react to the answer.
+function playSafely(v, onBlocked) {
+  const p = v.play();
+  if (p && typeof p.catch === 'function') p.catch(() => onBlocked && onBlocked());
+}
+
+function startTiles() {
+  tiles.forEach(v => {
+    v.src = src(v.dataset.camera, 'sub');
+    playSafely(v, showTapToPlay);
+  });
+}
+
+// If the browser refuses, say so and offer the one thing that fixes it: a
+// tap. One gesture releases every tile at once, so this costs a single tap
+// rather than one per camera.
+function showTapToPlay() {
+  if (!tapToPlay.hidden) return;
+  tapToPlay.hidden = false;
+}
 // Stopping the tiles matters: otherwise an expanded view costs the full
 // stream *plus* every tile still running, and the expanded camera is paid
 // for twice.
@@ -206,6 +247,9 @@ let currentQuality = 'full';
 function loadOverlay(cam, quality, audio) {
   currentQuality = quality;
   overlayVideo.src = src(cam, quality, audio);
+  // Normally fine -- expanding is always preceded by a tap -- but say so
+  // rather than showing a frozen frame if a browser still declines.
+  playSafely(overlayVideo, () => say('Tap the video to start playback.'));
   watchForStall();
 }
 
@@ -394,6 +438,23 @@ async function refreshUsage() {
     if (r.ok) renderUsage((await r.json()).bytes);
   } catch (e) { /* transient; next beat retries */ }
 }
+
+// The click itself is the gesture the autoplay policy was waiting for, so
+// playing from inside this handler is what makes it work.
+tapToPlay.addEventListener('click', () => {
+  tapToPlay.hidden = true;
+  tiles.forEach(v => { if (!v.getAttribute('src')) v.src = src(v.dataset.camera, 'sub'); });
+  tiles.forEach(v => playSafely(v));
+});
+
+// Phones stop decoding when the tab goes to the background and do not always
+// resume on return -- which looks identical to the bug this replaced. Nudge
+// the tiles when the page becomes visible again, but only if nothing is
+// expanded (the overlay owns the screen in that case).
+addEventListener('visibilitychange', () => {
+  if (document.hidden || !overlay.hidden || dlg.open) return;
+  tiles.forEach(v => { if (v.paused && v.getAttribute('src')) playSafely(v, showTapToPlay); });
+});
 
 startTiles();
 sendBeat();

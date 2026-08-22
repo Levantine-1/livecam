@@ -84,13 +84,24 @@
     }, 1000);
   }
 
+  // AbortSignal.timeout is Chrome 103+ / Safari 16+. Older iPhones are
+  // exactly the audience this feature exists for, so fall back to an
+  // AbortController rather than letting the probe throw and silently never
+  // find the LAN.
+  function abortAfter(ms) {
+    if (AbortSignal.timeout) return AbortSignal.timeout(ms);
+    const c = new AbortController();
+    setTimeout(() => c.abort(), ms);
+    return c.signal;
+  }
+
   async function check() {
     if (declined()) { stop(); return; }
     try {
       // An unreachable private address does not fail fast -- it hangs until
       // the TCP timeout, which is far longer than anyone will wait. The
       // abort is what makes "not at home" a quick, quiet answer.
-      await fetch(PING, { cache: 'no-store', signal: AbortSignal.timeout(2000) });
+      await fetch(PING, { cache: 'no-store', signal: abortAfter(2000) });
       clearInterval(probe); probe = null;
       offer();
     } catch (e) { /* not reachable from here; try again later */ }
