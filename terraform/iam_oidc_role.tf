@@ -23,10 +23,28 @@ data "aws_iam_policy_document" "github_actions_assume_role" {
     }
 
     # Scoped to pushes to master specifically, not a bare repo:* wildcard.
+    # Two values because GitHub is migrating the `sub` claim to an
+    # "immutable" form embedding numeric owner and repo IDs -- observed
+    # live on this repo as
+    #   repo:Levantine-1@71067517/livecam@1342417979:ref:refs/heads/master
+    # instead of the classic
+    #   repo:Levantine-1/livecam:ref:refs/heads/master
+    # StringEquals against only the classic form silently stops matching
+    # once a repo is switched over, and it surfaces as a flat "Not
+    # authorized to perform sts:AssumeRoleWithWebIdentity" with no hint
+    # that the claim shape is what changed. Accepting both spans the
+    # migration.
+    #
+    # Still pinned to this exact owner and repo -- the wildcards only cover
+    # the numeric IDs, anchored after "Levantine-1@" and "/livecam@". This
+    # is not a repo:* style wildcard.
     condition {
-      test     = "StringEquals"
+      test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:Levantine-1/livecam:ref:refs/heads/master"]
+      values = [
+        "repo:Levantine-1/livecam:ref:refs/heads/master",
+        "repo:Levantine-1@*/livecam@*:ref:refs/heads/master",
+      ]
     }
   }
 }
