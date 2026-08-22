@@ -24,18 +24,6 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Debug OIDC claims (temporary)
-        run: |
-          RESP=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com")
-          python3 -c "
-import sys,json,base64
-tok=json.loads(sys.argv[1])['value']
-part=tok.split('.')[1]; part+='='*(-len(part)%4)
-c=json.loads(base64.urlsafe_b64decode(part))
-for k in ('sub','aud','repository','repository_owner','ref','workflow'):
-    print(k,'=',repr(c.get(k)))
-" "$RESP"
-
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
