@@ -34,14 +34,19 @@ EXPOSE 5000
 #     worker won't be recycled, which is the right trade for an app whose
 #     normal case is holding connections open for minutes.
 #
-# 2 workers x 32 threads = 64 concurrent streams, sized for the planned
-# 6 cameras against ~10 viewers, since each viewer's dashboard opens one
-# stream per camera they can see.
+# ONE worker, many threads -- not a bigger process count. Live-stream
+# tokens, heartbeat timestamps and the full-quality stream count are all
+# module-level dicts, which are per-process: with 2 workers a token minted
+# by one was unknown to the other, so requests 403d depending on which
+# worker answered. Threads share memory, and these streams are I/O-bound
+# (blocked on the upstream socket, not the GIL), so concurrency is
+# unaffected. 96 threads covers 6 cameras against ~10 viewers with room,
+# since each viewer holds one stream per camera they can see.
 CMD ["gunicorn", "livecam:app", \
      "-b", "0.0.0.0:5000", \
      "--worker-class", "gthread", \
-     "--workers", "2", \
-     "--threads", "32", \
+     "--workers", "1", \
+     "--threads", "96", \
      "--timeout", "0", \
      "--access-logfile", "-", \
      "--error-logfile", "-"]
