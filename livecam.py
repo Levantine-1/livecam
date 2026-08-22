@@ -40,6 +40,7 @@ import requests
 import yaml
 from flask import (Flask, Response, abort, jsonify, redirect, render_template,
                    request, session, stream_with_context, url_for)
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
@@ -208,6 +209,22 @@ def egress_this_month():
         return stored + _egress_pending
 
 
+def lan_switch_context():
+    """Template variables for the "you could be on the LAN" behaviour.
+
+    Only meaningful on the public hostname, and only when a LAN hostname
+    exists to offer. Both the banner and the reachability probe hang off
+    this, so they can never disagree about which route the viewer is on.
+    """
+    offer = is_public_request() and bool(LAN_HOSTNAME)
+    return {
+        "offer_lan": offer,
+        "lan_hostname": LAN_HOSTNAME,
+        "lan_url": f"https://{LAN_HOSTNAME}/" if LAN_HOSTNAME else None,
+        "lan_ping_url": f"https://{LAN_HOSTNAME}/api/ping" if LAN_HOSTNAME else None,
+    }
+
+
 def is_public_request():
     """True when this request arrived on the internet-facing hostname.
 
@@ -337,7 +354,11 @@ def login():
             log.warning("login failed user=%s ip=%s", username, ip)
             error = "Incorrect username or password."
 
-    return render_template("login.html", error=error, next=target), (
+    # Offered here too, not just on the dashboard: someone who switches
+    # before typing their password needs no handoff token at all, because
+    # they log in on the LAN origin to begin with.
+    return render_template("login.html", error=error, next=target,
+                           **lan_switch_context()), (
         200 if request.method == "GET" else 401
     )
 
@@ -346,6 +367,90 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+
+# --------------------------------------------------------------------------
+# Moving a viewer from the public route onto the LAN route
+#
+# The public page probes the LAN hostname and offers to switch. Both names
+# reach this same container, but they are different origins, so the session
+# cookie does not follow -- and sending someone from a working page to a
+# login form is worse than leaving them where they were.
+#
+# The alternative was a cookie scoped to `.levantine.io`, which would have
+# handed livecam's session cookie to every other app on the domain. A
+# single-use signed token costs a few lines and leaks nothing.
+# --------------------------------------------------------------------------
+HANDOFF_MAX_AGE_SECONDS = int(os.environ.get("HANDOFF_MAX_AGE_SECONDS", "60"))
+_handoff_lock = threading.Lock()
+_handoff_used = set()
+
+
+def _handoff_serializer():
+    return URLSafeTimedSerializer(app.secret_key, salt="livecam-handoff")
+
+
+@app.route("/api/ping")
+def ping():
+    """Reachability probe. Deliberately unauthenticated and empty.
+
+    The public page uses this to find out whether the LAN address is
+    reachable from wherever the viewer currently is. It has to answer
+    cross-origin to be useful, so it says nothing at all beyond "something
+    is listening here" -- no body, no session, no data.
+    """
+    resp = Response(status=204)
+    if PUBLIC_HOSTNAME:
+        resp.headers["Access-Control-Allow-Origin"] = f"https://{PUBLIC_HOSTNAME}"
+        resp.headers["Vary"] = "Origin"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/handoff", methods=["POST"])
+@login_required
+def handoff_token():
+    """Mint a short-lived token that moves this session to the other hostname."""
+    token = _handoff_serializer().dumps(current_user())
+    return jsonify({"token": token, "max_age": HANDOFF_MAX_AGE_SECONDS})
+
+
+@app.route("/handoff")
+def handoff():
+    """Consume a handoff token and start a session for the named user."""
+    token = request.args.get("t", "")
+    try:
+        username = _handoff_serializer().loads(
+            token, max_age=HANDOFF_MAX_AGE_SECONDS
+        )
+    except SignatureExpired:
+        log.warning("handoff token expired")
+        return redirect(url_for("login"))
+    except BadSignature:
+        log.warning("handoff token invalid")
+        return redirect(url_for("login"))
+
+    # Single use. One gunicorn worker holds all of this, which is the same
+    # reason live-stream tokens work at all here.
+    with _handoff_lock:
+        if token in _handoff_used:
+            log.warning("handoff token replayed user=%s", username)
+            return redirect(url_for("login"))
+        _handoff_used.add(token)
+        # The set only needs to outlive the token's own validity window.
+        if len(_handoff_used) > 512:
+            _handoff_used.clear()
+
+    # A token names a user who may since have been removed from
+    # permissions.yml, so re-check rather than trusting the signature alone.
+    if username not in user_entries(load_permissions()):
+        log.warning("handoff for unknown user=%s", username)
+        return redirect(url_for("login"))
+
+    session.clear()
+    session["user"] = username
+    log.info("handoff accepted user=%s host=%s", username, request.host)
+    return redirect("/")
 
 
 def check_permission(username, permissions, now=None):
@@ -377,8 +482,21 @@ def _prune_stale_sessions():
         return len(_live_sessions)
 
 
-def resolve_stream_name(camera, audio_allowed, quality):
+def resolve_stream_name(camera, audio_allowed, quality, want_audio=False):
     """Map (camera, permissions, requested quality) onto a go2rtc stream.
+
+    Audio is opt-in per request, not implied by permission. The expanded
+    view froze on its first frame for exactly this reason: it was handed an
+    unmuted stream carrying an AAC track, and browsers block audible
+    autoplay, so the element buffered ~7 Mbps of perfectly good video (the
+    server logs show it delivered 10-18 MB per attempt) and never rendered
+    it. Tiles worked throughout because they are muted and audio-free.
+    Serving audio only when the viewer has actually asked for it -- by
+    pressing a control, which is the user gesture the autoplay policy wants
+    -- makes the default case behave like the tiles that already work.
+
+    `audio_allowed` still has the final say, so asking for audio without
+    permission gets the stripped stream rather than an error.
 
     Audio gating is enforced by *which stream is requested*: the `_noaudio`
     variants are published by go2rtc with the audio track genuinely removed
@@ -399,7 +517,7 @@ def resolve_stream_name(camera, audio_allowed, quality):
     """
     if quality != "full":
         return f"{camera}_sub_noaudio"
-    return camera if audio_allowed else f"{camera}_noaudio"
+    return camera if (audio_allowed and want_audio) else f"{camera}_noaudio"
 
 
 @app.route("/api/heartbeat", methods=["POST"])
@@ -470,7 +588,8 @@ def live(camera):
                 stream_id = object()
                 _full_streams.add(stream_id)
 
-    stream = resolve_stream_name(camera, audio_allowed, quality)
+    want_audio = request.args.get("audio") == "1"
+    stream = resolve_stream_name(camera, audio_allowed, quality, want_audio)
 
     upstream = requests.get(
         f"{GO2RTC_URL}/api/stream.mp4",
@@ -540,14 +659,15 @@ def dashboard():
         audio_allowed=audio_allowed,
         token=token,
         idle_prompt_seconds=IDLE_PROMPT_SECONDS,
-        # The banner is a nudge for people already at home on the public
-        # URL, so it only makes sense on that hostname -- and only if a LAN
-        # hostname actually exists to send them to.
-        show_home_banner=is_public_request() and bool(LAN_HOSTNAME),
-        lan_url=f"https://{LAN_HOSTNAME}/" if LAN_HOSTNAME else None,
-        lan_hostname=LAN_HOSTNAME,
         egress_bytes=used,
         free_tier_bytes=FREE_TIER_BYTES,
+        # There is a session here, so switching hosts needs a handoff token;
+        # the login page has none and needs none.
+        authed=True,
+        # The banner and the LAN probe are both nudges for people already at
+        # home on the public URL, so both only make sense on that hostname
+        # -- and only if a LAN hostname exists to send them to.
+        **lan_switch_context(),
     )
 
 

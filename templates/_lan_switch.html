@@ -1,0 +1,111 @@
+{% if offer_lan %}
+{# Shown only on the public hostname, and only once the LAN address has been
+   proven reachable from wherever this browser actually is. Included by both
+   the dashboard and the login page -- switching *before* logging in is the
+   cheapest path of all, since the session is then created on the LAN origin
+   and no handoff is needed. #}
+<style>
+  #lanToast[hidden] { display:none; }
+  #lanToast { position:fixed; left:50%; bottom:1rem; transform:translateX(-50%); z-index:80;
+              width:min(calc(100% - 2rem),440px); padding:.9rem 1rem; border-radius:10px;
+              background:#18291c; border:1px solid #2f6b3d; box-shadow:0 6px 24px #0008;
+              font-size:.9rem; color:#dcecc9;
+              font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  #lanToast .row { display:flex; gap:.5rem; margin-top:.7rem; }
+  #lanToast button { flex:1; padding:.5rem .8rem; border:0; border-radius:6px;
+                     font-size:.85rem; cursor:pointer; }
+  #lanGo { background:#3f9e57; color:#fff; font-weight:600; }
+  #lanStay { background:#2a2f3a; color:#e8eaed; }
+</style>
+<div id="lanToast" hidden role="status">
+  <span id="lanToastText"></span>
+  <div class="row">
+    <button id="lanGo" type="button">Switch now</button>
+    <button id="lanStay" type="button">Stay here</button>
+  </div>
+</div>
+<script>
+(() => {
+  const PING = {{ lan_ping_url | tojson }};
+  const LAN  = {{ lan_url | tojson }};
+  const HOST = {{ lan_hostname | tojson }};
+  // Whether a livecam session exists to carry across. The login page has
+  // none, and needs none -- logging in on the LAN origin is the handoff.
+  const AUTHED = {{ (authed | default(false)) | tojson }};
+  const STAY_KEY = 'livecam.lanToast.stay';
+  const COUNTDOWN = 3;
+
+  const toast = document.getElementById('lanToast');
+  const text = document.getElementById('lanToastText');
+  let timer = null, probe = null;
+
+  // sessionStorage, not localStorage: being at home is not a permanent
+  // property of a browser. Declining stops the nagging for this visit and
+  // the offer returns next time.
+  const declined = () => { try { return sessionStorage.getItem(STAY_KEY) === '1'; } catch (e) { return false; } };
+
+  function stop() {
+    clearInterval(timer); timer = null;
+    clearInterval(probe); probe = null;
+    toast.hidden = true;
+  }
+
+  async function go() {
+    clearInterval(timer); timer = null;
+    let target = LAN;
+    if (AUTHED) {
+      // Different origin, so the session cookie does not follow. Trade it
+      // for a single-use signed token rather than widening the cookie to
+      // every other app on levantine.io.
+      try {
+        const r = await fetch('/api/handoff', { method: 'POST' });
+        if (r.ok) {
+          const t = (await r.json()).token;
+          target = LAN.replace(/\/$/, '') + '/handoff?t=' + encodeURIComponent(t);
+        }
+      } catch (e) { /* fall back to a plain switch; worst case is a login */ }
+    }
+    location.replace(target);
+  }
+
+  function offer() {
+    if (declined() || !toast.hidden) return;
+    let left = COUNTDOWN;
+    const paint = () => {
+      text.textContent =
+        `Local network detected. Switching to ${HOST} in ${left}… `
+        + `It stays on your home network, so it is faster and free.`;
+    };
+    paint();
+    toast.hidden = false;
+    timer = setInterval(() => {
+      if (--left <= 0) { paint(); go(); return; }
+      paint();
+    }, 1000);
+  }
+
+  async function check() {
+    if (declined()) { stop(); return; }
+    try {
+      // An unreachable private address does not fail fast -- it hangs until
+      // the TCP timeout, which is far longer than anyone will wait. The
+      // abort is what makes "not at home" a quick, quiet answer.
+      await fetch(PING, { cache: 'no-store', signal: AbortSignal.timeout(2000) });
+      clearInterval(probe); probe = null;
+      offer();
+    } catch (e) { /* not reachable from here; try again later */ }
+  }
+
+  document.getElementById('lanGo').addEventListener('click', go);
+  document.getElementById('lanStay').addEventListener('click', () => {
+    try { sessionStorage.setItem(STAY_KEY, '1'); } catch (e) { /* private mode */ }
+    stop();
+  });
+
+  if (!declined()) {
+    check();
+    probe = setInterval(check, 60000);
+  }
+})();
+</script>
+{% endif %}

@@ -139,13 +139,20 @@ def main():
           livecam.check_permission("nobody", perms)[0] == set())
 
     # Audio gating is enforced by which go2rtc stream gets requested, so
-    # these three mappings are the enforcement.
+    # these mappings are the enforcement.
     check("tiles take the audio-free substream",
           livecam.resolve_stream_name("cam", True, "sub") == "cam_sub_noaudio")
-    check("full quality with audio permission",
-          livecam.resolve_stream_name("cam", True, "full") == "cam")
-    check("full quality without audio permission drops the track",
-          livecam.resolve_stream_name("cam", False, "full") == "cam_noaudio")
+    # The default has to be audio-free even for a permitted user: an unmuted
+    # element carrying an AAC track is what browsers refuse to autoplay, and
+    # that refusal is what froze the expanded view on its first frame.
+    check("full quality is audio-free until asked for",
+          livecam.resolve_stream_name("cam", True, "full") == "cam_noaudio")
+    check("full quality with audio requested and permitted",
+          livecam.resolve_stream_name("cam", True, "full", want_audio=True) == "cam")
+    check("asking for audio without permission still drops the track",
+          livecam.resolve_stream_name("cam", False, "full", want_audio=True) == "cam_noaudio")
+    check("audio is never added to a substream",
+          livecam.resolve_stream_name("cam", True, "sub", want_audio=True) == "cam_sub_noaudio")
 
     r = c.get(f"/live/guinea-pig-cage-9?token={token}", headers={"Host": PUB})
     check("a camera not on the user's list is refused", r.status_code == 403, r.status_code)
@@ -207,6 +214,67 @@ def main():
     r = c.get("/", headers={"Host": PUB, "Accept": "text/html"})
     check("logout ends the session",
           r.status_code == 302 and "/login" in r.headers["Location"], r.status_code)
+
+    # --- LAN switch: ping, handoff ---
+    fresh = app.test_client()
+    r = fresh.get("/api/ping", headers={"Host": LAN})
+    check("/api/ping answers without a session", r.status_code == 204, r.status_code)
+    check("/api/ping allows the public origin cross-origin",
+          r.headers.get("Access-Control-Allow-Origin") == f"https://{PUB}",
+          r.headers.get("Access-Control-Allow-Origin"))
+    check("/api/ping carries no body", r.data == b"", r.data[:40])
+
+    session_c = app.test_client()
+    session_c.post("/login", data={"username": "admin", "password": PASSWORD},
+                   headers={"Host": PUB})
+    r = session_c.post("/api/handoff", headers={"Host": PUB})
+    check("handoff token minted for a logged-in user", r.status_code == 200, r.status_code)
+    handoff = r.json["token"]
+
+    r = app.test_client().post("/api/handoff", headers={"Host": PUB})
+    check("handoff refused without a session", r.status_code == 401, r.status_code)
+
+    # The point of the whole mechanism: arrive on the other hostname already
+    # logged in, without widening the session cookie to every app on the domain.
+    arriving = app.test_client()
+    r = arriving.get(f"/handoff?t={handoff}", headers={"Host": LAN})
+    check("handoff establishes a session on the LAN host",
+          r.status_code == 302 and r.headers["Location"] == "/", r.headers.get("Location"))
+    r = arriving.get("/", headers={"Host": LAN})
+    check("handed-off session can load the dashboard", r.status_code == 200, r.status_code)
+
+    replay = app.test_client()
+    r = replay.get(f"/handoff?t={handoff}", headers={"Host": LAN})
+    check("a handoff token cannot be replayed",
+          r.status_code == 302 and "/login" in r.headers["Location"], r.headers.get("Location"))
+
+    r = app.test_client().get("/handoff?t=not-a-real-token", headers={"Host": LAN})
+    check("a forged handoff token is refused",
+          r.status_code == 302 and "/login" in r.headers["Location"], r.headers.get("Location"))
+
+    expired = livecam._handoff_serializer().dumps("admin")
+    saved, livecam.HANDOFF_MAX_AGE_SECONDS = livecam.HANDOFF_MAX_AGE_SECONDS, -1
+    r = app.test_client().get(f"/handoff?t={expired}", headers={"Host": LAN})
+    livecam.HANDOFF_MAX_AGE_SECONDS = saved
+    check("an expired handoff token is refused",
+          r.status_code == 302 and "/login" in r.headers["Location"], r.headers.get("Location"))
+
+    # Signed by this app's secret, but naming someone since removed.
+    ghost = livecam._handoff_serializer().dumps("deleted-user")
+    r = app.test_client().get(f"/handoff?t={ghost}", headers={"Host": LAN})
+    check("handoff for a user no longer in permissions.yml is refused",
+          r.status_code == 302 and "/login" in r.headers["Location"], r.headers.get("Location"))
+
+    # The switch offer must never appear on the host it would send you to.
+    r = session_c.get("/", headers={"Host": PUB})
+    check("LAN switch offer rendered on the public hostname",
+          "lanToast" in r.get_data(as_text=True))
+    r = session_c.get("/", headers={"Host": LAN})
+    check("LAN switch offer absent on the LAN hostname",
+          "lanToast" not in r.get_data(as_text=True))
+    r = app.test_client().get("/login", headers={"Host": PUB})
+    check("login page offers the switch too",
+          "lanToast" in r.get_data(as_text=True))
 
     guesser = app.test_client()
     headers = {"Host": PUB, "X-Forwarded-For": "203.0.113.9"}

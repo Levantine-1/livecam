@@ -42,9 +42,17 @@
              display:flex; flex-direction:column; }
   #overlay .bar { display:flex; align-items:center; gap:.75rem; padding:.6rem 1rem; background:#1c1f26cc; }
   #overlay .bar strong { font-size:.95rem; }
-  #overlay .bar button { margin-left:auto; background:#2a2f3a; color:#e8eaed; border:0; border-radius:6px;
+  #overlay .bar button { background:#2a2f3a; color:#e8eaed; border:0; border-radius:6px;
                          padding:.4rem .8rem; font-size:.85rem; cursor:pointer; }
+  #overlay .bar button:hover { background:#3d4757; }
+  #overlay .bar .right { margin-left:auto; display:flex; align-items:center; gap:.5rem; }
   #overlay video { flex:1; min-height:0; width:100%; background:#000; object-fit:contain; }
+  #soundBtn.on { background:#2f6fd0; }
+  #gainWrap[hidden] { display:none; }
+  #gainWrap { display:flex; align-items:center; gap:.4rem; font-size:.75rem; color:#9aa3b2; }
+  #gain { width:90px; }
+  .notice { padding:.5rem 1rem; font-size:.8rem; background:#3a2f19; color:#f0d9a8; }
+  .notice[hidden] { display:none; }
 </style>
 </head>
 <body>
@@ -56,7 +64,7 @@
   <a href="{{ url_for('logout') }}">sign out</a>
 </header>
 
-{% if show_home_banner %}
+{% if offer_lan %}
 <!-- Only rendered on the public hostname. Reaching the house from outside
      goes out to AWS and back down the home uplink, so watching from the
      sofa on this URL pays for a round trip to Oregon that the LAN link
@@ -102,10 +110,27 @@
   <div class="bar">
     <strong id="overlayName"></strong>
     <span class="badge" id="overlayRes">&mdash;</span>
-    <span class="badge">{{ 'audio' if audio_allowed else 'no audio' }}</span>
-    <button id="closeBtn" type="button">Close (Esc)</button>
+    <div class="right">
+      {% if audio_allowed %}
+      <!-- Sound is off until asked for, and asking is a click. That click is
+           the user gesture browsers require before they will play audible
+           media -- without it the element silently refuses to start, which
+           is exactly why this view used to sit on a frozen first frame. -->
+      <button id="soundBtn" type="button" aria-pressed="false">&#128263; Sound off</button>
+      <span id="gainWrap" hidden>
+        <label for="gain">boost</label>
+        <input id="gain" type="range" min="100" max="400" step="10" value="200">
+        <span id="gainVal">200%</span>
+      </span>
+      {% else %}
+      <span class="badge">no audio</span>
+      {% endif %}
+      <button id="closeBtn" type="button">Close (Esc)</button>
+    </div>
   </div>
-  <video id="overlayVideo" autoplay playsinline{{ '' if audio_allowed else ' muted' }}></video>
+  <!-- Always starts muted, exactly like the tiles that have always worked. -->
+  <video id="overlayVideo" autoplay playsinline muted></video>
+  <p class="notice" id="overlayNotice" hidden></p>
 </div>
 
 <dialog id="idle">
@@ -113,6 +138,8 @@
   <p>Streaming paused to avoid using bandwidth in the background.</p>
   <button id="resume">Resume</button>
 </dialog>
+
+{% include "_lan_switch.html" %}
 
 <script>
 // Tiles deliberately pull the camera's own low-res substream (~0.65 Mbps)
@@ -130,9 +157,20 @@ const overlayVideo = document.getElementById('overlayVideo');
 const overlayName = document.getElementById('overlayName');
 const dlg = document.getElementById('idle');
 
-const src = (cam, q) => `/live/${encodeURIComponent(cam)}?token=${encodeURIComponent(TOKEN)}&quality=${q}`;
+const AUDIO_ALLOWED = {{ audio_allowed | tojson }};
+
+const src = (cam, q, audio) =>
+  `/live/${encodeURIComponent(cam)}?token=${encodeURIComponent(TOKEN)}&quality=${q}`
+  + (audio ? '&audio=1' : '');
 
 function stopVideo(v) { v.pause(); v.removeAttribute('src'); v.load(); }
+
+const notice = document.getElementById('overlayNotice');
+function say(msg) {
+  if (!msg) { notice.hidden = true; return; }
+  notice.textContent = msg;
+  notice.hidden = false;
+}
 
 // Show the resolution the browser actually decoded. Tiles should read
 // 704x480 (the camera's substream) and the expanded view 2960x1668 -- at
@@ -158,22 +196,114 @@ function startTiles() { tiles.forEach(v => { v.src = src(v.dataset.camera, 'sub'
 // for twice.
 function stopTiles() { tiles.forEach(stopVideo); }
 
+// --- expanded view -------------------------------------------------------
+// State for the one camera currently expanded, so sound and the stall
+// fallback can both re-request the same stream at different settings.
+let current = null;          // camera name
+let soundOn = false;         // has the viewer asked for audio this session
+let currentQuality = 'full';
+
+function loadOverlay(cam, quality, audio) {
+  currentQuality = quality;
+  overlayVideo.src = src(cam, quality, audio);
+  watchForStall();
+}
+
 function expand(cam) {
   if (!overlay.hidden) return;
   stopTiles();
+  current = cam;
   overlayName.textContent = cam;
   overlay.hidden = false;
-  overlayVideo.src = src(cam, 'full');
+  say('');
+  // Muted and audio-free by default. Sound is a separate, explicit act --
+  // see the sound button below.
+  loadOverlay(cam, 'full', soundOn);
   // History entry so the browser Back button is a natural way out, which
   // the native Fullscreen API cannot offer (Esc exits it, Back does not).
   history.pushState({ expanded: cam }, '');
 }
 
+// If decoded playback stops advancing while the element believes it is
+// playing, the stream is arriving but not rendering -- a slow client on a
+// 2960x1668 feed, or a link that cannot keep up. Drop to the substream and
+// say so, rather than leaving a frozen frame on screen with no explanation.
+let stallTimer = null;
+function watchForStall() {
+  clearInterval(stallTimer);
+  let last = -1, stuck = 0;
+  stallTimer = setInterval(() => {
+    if (overlay.hidden || overlayVideo.paused) return;
+    const t = overlayVideo.currentTime;
+    stuck = (t === last) ? stuck + 1 : 0;
+    last = t;
+    if (stuck >= 8 && currentQuality === 'full') {
+      clearInterval(stallTimer);
+      say('Full quality was not keeping up here, so this dropped to the lower-resolution stream.');
+      loadOverlay(current, 'sub', false);
+    }
+  }, 1000);
+}
+
 function collapse() {
   if (overlay.hidden) return;
+  clearInterval(stallTimer); stallTimer = null;
   stopVideo(overlayVideo);
   overlay.hidden = true;
+  say('');
+  current = null;
   startTiles();
+}
+
+// --- sound ---------------------------------------------------------------
+// Two separate problems, which is why this is more than an unmute button.
+//
+// 1. Audible autoplay is blocked without a user gesture, so the stream is
+//    requested audio-free and muted until this button is pressed. The press
+//    itself is the gesture.
+// 2. The cameras encode 8 kHz mono at a low level (peaks around -14 dB on
+//    cage 1, -35 dB on cage 2). A video element's volume caps at 1.0, so it
+//    cannot make a quiet source louder -- only a WebAudio gain stage can.
+const soundBtn = document.getElementById('soundBtn');
+if (soundBtn) {
+  const gainWrap = document.getElementById('gainWrap');
+  const gainInput = document.getElementById('gain');
+  const gainVal = document.getElementById('gainVal');
+  let ctx = null, gainNode = null;
+
+  // createMediaElementSource may be called only once per element, and it
+  // survives src changes -- so wire it up once, lazily, on first use.
+  function ensureGraph() {
+    if (ctx) return;
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    gainNode = ctx.createGain();
+    ctx.createMediaElementSource(overlayVideo).connect(gainNode).connect(ctx.destination);
+    applyGain();
+  }
+  function applyGain() {
+    if (gainNode) gainNode.gain.value = Number(gainInput.value) / 100;
+    gainVal.textContent = gainInput.value + '%';
+  }
+
+  gainInput.addEventListener('input', applyGain);
+
+  soundBtn.addEventListener('click', () => {
+    soundOn = !soundOn;
+    soundBtn.setAttribute('aria-pressed', String(soundOn));
+    soundBtn.innerHTML = soundOn ? '\u{1F50A} Sound on' : '\u{1F507} Sound off';
+    soundBtn.classList.toggle('on', soundOn);
+    gainWrap.hidden = !soundOn;
+
+    if (soundOn) {
+      ensureGraph();
+      if (ctx.state === 'suspended') ctx.resume();
+    }
+    overlayVideo.muted = !soundOn;
+    // The audio-free and audio-bearing feeds are different go2rtc streams,
+    // so switching sound means re-requesting -- the server decides which,
+    // and refuses audio outright to users without permission.
+    if (current) loadOverlay(current, currentQuality, soundOn);
+  });
 }
 
 // Esc and the close button both go through history.back(), so every exit

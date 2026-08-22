@@ -24,6 +24,17 @@ What this app adds on top of the backends:
   matter of which stream gets requested rather than anything this app does
   to the media. Verified against a live camera: the `_noaudio` track list is
   video-only, not merely muted.
+
+  Audio is also **opt-in per view**, not implied by permission. The expanded
+  view is served the audio-free stream and starts muted; pressing the sound
+  button re-requests the audio-bearing variant. This is not cosmetic --
+  browsers block audible autoplay, and an unmuted element carrying an AAC
+  track is why the expanded view used to sit frozen on its first frame while
+  the server happily delivered ~7 Mbps of perfectly good video to it. The
+  button press is the user gesture the autoplay policy wants. The cameras
+  encode 8 kHz mono at a low level (peaks around -14 dB), so there is also a
+  WebAudio gain stage behind the boost slider -- a video element's own
+  volume caps at 1.0 and cannot make a quiet source louder.
 - **Bandwidth discipline**: tiles use the camera's own 704x480 substream
   (~0.65 Mbps) and only the expanded view pulls the full 2960x1668 feed
   (~7 Mbps), with a cap on concurrent full-quality streams and a heartbeat
@@ -65,10 +76,24 @@ python3 -c "from werkzeug.security import generate_password_hash as h; import ge
 
 `livecam.levantine.io` is the public route: it resolves to AWS and relays
 back down into the house over WireGuard. `livecam-lan.levantine.io` resolves
-straight to the Docker host on the LAN. Both are served by the same
-container and both are covered by the existing `*.levantine.io` wildcard
-cert -- which is exactly why the LAN name is a flat label rather than
-`livecam.local.levantine.io`, since a wildcard matches only one label.
+to `service` at 10.69.69.133, which terminates TLS and proxies to the Docker
+host -- **not** straight to the Docker host, which is unreachable from the
+house. dockerhost1 has one NIC on the internal 192.168.1.0/24 network behind
+OPNsense, and the home LAN sits on OPNsense's WAN side, so nothing at home
+can route to it; `service` is the only VM with an interface on both. Both
+names are served by the same container and covered by the existing
+`*.levantine.io` wildcard cert -- which is exactly why the LAN name is a
+flat label rather than `livecam.local.levantine.io`, since a wildcard
+matches only one label.
+
+Switching between them is offered automatically rather than remembered:
+on the public hostname the page probes `https://livecam-lan.../api/ping`,
+and if it answers, offers to switch with a short countdown. Accepting
+trades a single-use `itsdangerous` token through `/api/handoff` so the
+session survives the origin change -- rather than widening the session
+cookie to `.levantine.io`, which would hand it to every other app on the
+domain. Declining is remembered for the session only, since being at home
+is not a permanent property of a browser.
 
 Watching from home on the *public* name sends every frame up the uplink to
 Oregon and back down again, billed as egress, so the dashboard shows a
@@ -116,6 +141,7 @@ its env vars, Vault-injected secrets and volumes are declared.
 | `FREE_TIER_BYTES` | Free-tier allowance the meter is drawn against (default 100 GB) |
 | `MAX_FULL_QUALITY_SESSIONS` | Concurrent full-res live viewers before extra ones are served the substream (default 4) |
 | `HEARTBEAT_TIMEOUT_SECONDS` | Live stream is torn down after this long without a heartbeat (default 600) |
+| `HANDOFF_MAX_AGE_SECONDS` | Validity window for a single-use public->LAN session handoff token (default 60) |
 | `SESSION_COOKIE_SECURE` | Off by default: plain HTTP to this container is a supported path (nginx-proxy runs `HTTPS_METHOD=noredirect`, and the AWS relay arrives over HTTP), and setting it without that being true end to end makes login loop silently |
 
 ## Still unverified
