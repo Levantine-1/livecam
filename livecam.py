@@ -109,7 +109,14 @@ def resolve_zm_username(session_cookie):
     if not row:
         return None
 
-    match = re.search(r's:8:"username";s:\d+:"([^"]+)"', row[0])
+    # ZoneMinder stores sessions in PHP's *session* serialization
+    # (key|value;), not the array form -- a real row looks like:
+    #   ...;passwordHash|s:60:"$2b$...";username|s:5:"admin";AuthHash...|s:32:"..."
+    # An earlier version matched the array form (s:8:"username";s:5:"admin")
+    # and so never matched anything, which made every request look logged
+    # out. Anchored on a delimiter so a key merely ending in "username"
+    # can't be picked up instead.
+    match = re.search(r'(?:^|;)username\|s:\d+:"([^"]+)"', row[0])
     return match.group(1) if match else None
 
 
