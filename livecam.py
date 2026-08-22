@@ -549,6 +549,199 @@ def usage():
     )
 
 
+# --------------------------------------------------------------------------
+# HLS, for Safari and every browser on iOS
+#
+# The fragmented-MP4 path this app was built on does not work on iOS at all
+# -- not the tiles, not the expanded view. iOS Safari opens a <video> with a
+# Range request and expects 206; go2rtc answers 200 with a chunked body, and
+# Safari then refuses to play. Verified on a real iPhone: even tapping the
+# element does nothing, which rules out autoplay policy as the cause.
+#
+# HLS is the native answer there, and go2rtc already speaks it. Two details
+# were found the hard way and are the reason this is not simply a proxy:
+#
+#   * The `_noaudio` streams must NOT be used here. They are ffmpeg chains
+#     (`ffmpeg:<src>#video=copy`), and go2rtc's MPEG-TS muxer loses the H.264
+#     parameter sets across that chain -- the segments decode with continuous
+#     "non-existing PPS" errors, while the direct stream is clean. MP4 never
+#     showed it because SPS/PPS live in the container header there.
+#   * Audio is instead excluded with go2rtc's own track filter: asking for
+#     `video=h264` alone yields a video-only playlist. So gating still comes
+#     from the URL this server builds, never from the client.
+#
+# Segment URLs inside a media playlist are relative, so a playlist served at
+# /hls/playlist.m3u8 makes the browser ask for /hls/segment.ts -- which is
+# this same route. Nothing needs rewriting except the master playlist.
+# --------------------------------------------------------------------------
+M3U8_CONTENT_TYPE = "application/vnd.apple.mpegurl"
+
+# go2rtc mints a session id per master-playlist request. Mapping it back to a
+# user and camera is what lets the playlist and segment requests below be
+# authorised, since they carry only that id.
+HLS_SESSION_TTL_SECONDS = int(os.environ.get("HLS_SESSION_TTL_SECONDS", "300"))
+_hls_lock = threading.Lock()
+_hls_sessions = {}  # go2rtc id -> {"user", "camera", "quality", "metered", "seen"}
+
+
+def resolve_hls_source(camera, audio_allowed, quality, want_audio=False):
+    """go2rtc (src, params) for HLS -- direct streams plus a track filter.
+
+    Mirrors resolve_stream_name()'s decisions, but expresses "no audio" as
+    the absence of an audio track filter rather than by selecting a
+    separately published stream. Same guarantee, different mechanism: the
+    server decides, and a client asking for audio it may not have simply
+    does not get an audio track in the playlist.
+    """
+    params = {"video": "h264"}
+    if quality != "full":
+        return f"{camera}_sub", params
+    if audio_allowed and want_audio:
+        params["audio"] = "aac"
+    return camera, params
+
+
+def _prune_hls_sessions():
+    cutoff = time.time() - HLS_SESSION_TTL_SECONDS
+    with _hls_lock:
+        for sid in [s for s, v in _hls_sessions.items() if v["seen"] < cutoff]:
+            del _hls_sessions[sid]
+
+
+def _authorise_hls(session_id):
+    """Resolve an HLS session id to its owner, re-checking permission.
+
+    Re-checked per request rather than trusted from playlist time, so a
+    closing time window ends an iOS stream the same way it cuts an MP4 one
+    off mid-transfer.
+    """
+    if not session_id:
+        abort(403)
+    with _hls_lock:
+        entry = _hls_sessions.get(session_id)
+        if not entry or entry["user"] != current_user():
+            abort(403)
+        entry["seen"] = time.time()
+        camera, metered = entry["camera"], entry["metered"]
+
+    allowed, _ = check_permission(current_user(), load_permissions())
+    if camera not in allowed:
+        abort(403)
+    return camera, metered
+
+
+@app.route("/live/<camera>/master.m3u8")
+@login_required
+def live_hls(camera):
+    """Master playlist: authorise, ask go2rtc, and point at our own routes.
+
+    Deliberately a separate path from /live/<camera> rather than
+    /live/<camera>.m3u8 -- the latter would also match the MP4 rule with the
+    suffix swallowed into the camera name.
+    """
+    username = current_user()
+    allowed_cameras, audio_allowed = check_permission(username, load_permissions())
+    if camera not in allowed_cameras:
+        abort(403)
+
+    token = request.args.get("token")
+    with _sessions_lock:
+        entry = _live_sessions.get(token) if token else None
+        if not entry or entry["user"] != username:
+            abort(403)
+
+    quality = "full" if request.args.get("quality") == "full" else "sub"
+    want_audio = request.args.get("audio") == "1"
+    _prune_hls_sessions()
+
+    # Same cap as the MP4 path, counted over live HLS sessions instead of
+    # open connections. Degrade rather than refuse.
+    if quality == "full":
+        with _hls_lock:
+            active_full = sum(1 for v in _hls_sessions.values() if v["quality"] == "full")
+        if active_full >= MAX_FULL_QUALITY_SESSIONS:
+            quality = "sub"
+
+    src, params = resolve_hls_source(camera, audio_allowed, quality, want_audio)
+    upstream = requests.get(
+        f"{GO2RTC_URL}/api/stream.m3u8", params={"src": src, **params}, timeout=15
+    )
+    if upstream.status_code != 200:
+        log.warning("hls master failed camera=%s status=%s", camera, upstream.status_code)
+        abort(502)
+
+    # The master points at `hls/playlist.m3u8?id=SESSION`; rewrite that one
+    # line to our own route so the browser never talks to go2rtc directly.
+    metered = is_public_request()
+    session_ids = []
+    lines = []
+    for line in upstream.text.splitlines():
+        match = re.match(r"^hls/playlist\.m3u8\?id=(\w+)$", line.strip())
+        if match:
+            session_ids.append(match.group(1))
+            lines.append(f"/hls/playlist.m3u8?id={match.group(1)}")
+        else:
+            lines.append(line)
+
+    if not session_ids:
+        log.warning("hls master had no playlist line camera=%s", camera)
+        abort(502)
+
+    with _hls_lock:
+        for sid in session_ids:
+            _hls_sessions[sid] = {
+                "user": username,
+                "camera": camera,
+                "quality": quality,
+                "metered": metered,
+                "seen": time.time(),
+            }
+
+    log.info("hls start camera=%s src=%s audio=%s quality=%s user=%s metered=%s",
+             camera, src, "aac" in params.values(), quality, username, metered)
+
+    body = "\n".join(lines) + "\n"
+    if metered:
+        record_egress(len(body))
+    resp = Response(body, content_type=M3U8_CONTENT_TYPE)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Livecam-Stream"] = f"{src}{'+aac' if 'audio' in params else ''}"
+    return resp
+
+
+@app.route("/hls/<path:sub>")
+@login_required
+def hls_proxy(sub):
+    """Media playlists and segments, authorised by the go2rtc session id.
+
+    Segment references inside a media playlist are relative, so they resolve
+    back here without any rewriting -- the only thing this has to do is
+    check that the id belongs to the caller before passing bytes along.
+    """
+    if ".." in sub or sub.startswith("/"):
+        abort(400)
+
+    camera, metered = _authorise_hls(request.args.get("id"))
+
+    upstream = requests.get(
+        f"{GO2RTC_URL}/api/hls/{sub}",
+        params=request.args,
+        stream=True,
+        timeout=15,
+    )
+    body = upstream.content
+    if metered:
+        record_egress(len(body), flush=sub.endswith(".m3u8"))
+
+    content_type = upstream.headers.get(
+        "Content-Type",
+        M3U8_CONTENT_TYPE if sub.endswith(".m3u8") else "video/mp2t",
+    )
+    resp = Response(body, upstream.status_code, content_type=content_type)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/live/<camera>")
 @login_required
 def live(camera):

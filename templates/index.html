@@ -177,9 +177,25 @@ const tapToPlay = document.getElementById('tapToPlay');
 
 const AUDIO_ALLOWED = {{ audio_allowed | tojson }};
 
-const src = (cam, q, audio) =>
-  `/live/${encodeURIComponent(cam)}?token=${encodeURIComponent(TOKEN)}&quality=${q}`
-  + (audio ? '&audio=1' : '');
+// iOS -- every browser on it, since they are all WebKit -- cannot play the
+// fragmented MP4 this app serves everywhere else: Safari opens a <video>
+// with a Range request, expects 206, gets 200 and a chunked body, and gives
+// up. Confirmed on a real iPhone, where even tapping the element did
+// nothing, so it is the transport rather than the autoplay policy.
+//
+// Native HLS is the way in on WebKit, and canPlayType is the honest test
+// for it: Safari answers "maybe"/"probably", Chrome and Firefox answer "".
+// They keep the MP4 path, which has lower latency and already works.
+const NATIVE_HLS = !!document.createElement('video')
+  .canPlayType('application/vnd.apple.mpegurl');
+
+const src = (cam, q, audio) => {
+  const qs = `token=${encodeURIComponent(TOKEN)}&quality=${q}` + (audio ? '&audio=1' : '');
+  const cameraPath = encodeURIComponent(cam);
+  return NATIVE_HLS
+    ? `/live/${cameraPath}/master.m3u8?${qs}`
+    : `/live/${cameraPath}?${qs}`;
+};
 
 function stopVideo(v) { v.pause(); v.removeAttribute('src'); v.load(); }
 
@@ -336,12 +352,17 @@ if (soundBtn) {
     soundBtn.setAttribute('aria-pressed', String(soundOn));
     soundBtn.innerHTML = soundOn ? '\u{1F50A} Sound on' : '\u{1F507} Sound off';
     soundBtn.classList.toggle('on', soundOn);
-    gainWrap.hidden = !soundOn;
 
-    if (soundOn) {
+    // Skipped on WebKit: routing a natively-played HLS element through
+    // MediaElementSource there tends to yield silence, and iOS ignores the
+    // volume property outright (the hardware buttons own it). Better to
+    // hand over plain unmuted audio than a slider that does nothing or,
+    // worse, mutes it.
+    if (soundOn && !NATIVE_HLS) {
       ensureGraph();
       if (ctx.state === 'suspended') ctx.resume();
     }
+    gainWrap.hidden = !soundOn || NATIVE_HLS;
     overlayVideo.muted = !soundOn;
     // The audio-free and audio-bearing feeds are different go2rtc streams,
     // so switching sound means re-requesting -- the server decides which,

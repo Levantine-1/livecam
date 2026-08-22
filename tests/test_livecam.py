@@ -230,6 +230,61 @@ def main():
     check("logout ends the session",
           r.status_code == 302 and "/login" in r.headers["Location"], r.status_code)
 
+    # --- HLS source selection (the iOS path) ---
+    # The _noaudio streams are deliberately absent here: they are ffmpeg
+    # chains and go2rtc's TS muxer loses the H.264 parameter sets across
+    # them, so HLS segments decode with continuous "non-existing PPS"
+    # errors. Audio is excluded with a track filter on the direct stream
+    # instead, which is clean.
+    s, p = livecam.resolve_hls_source("cam", True, "sub")
+    check("HLS tiles use the direct substream, video only",
+          s == "cam_sub" and p == {"video": "h264"}, (s, p))
+    s, p = livecam.resolve_hls_source("cam", True, "full")
+    check("HLS full quality is video-only until audio is asked for",
+          s == "cam" and p == {"video": "h264"}, (s, p))
+    s, p = livecam.resolve_hls_source("cam", True, "full", want_audio=True)
+    check("HLS full quality adds audio when permitted and requested",
+          s == "cam" and p.get("audio") == "aac", (s, p))
+    s, p = livecam.resolve_hls_source("cam", False, "full", want_audio=True)
+    check("HLS never adds audio without permission",
+          s == "cam" and "audio" not in p, (s, p))
+    s, p = livecam.resolve_hls_source("cam", True, "sub", want_audio=True)
+    check("HLS tiles never carry audio", "audio" not in p, p)
+    check("no HLS source uses the parameter-set-losing _noaudio chain",
+          all("_noaudio" not in livecam.resolve_hls_source("cam", a, q, w)[0]
+              for a in (True, False) for q in ("sub", "full") for w in (True, False)))
+
+    # Segment and playlist requests carry only a go2rtc session id, so the
+    # id -> owner mapping is the entire authorisation story for them.
+    session_probe = app.test_client()
+    session_probe.post("/login", data={"username": "admin", "password": PASSWORD},
+                       headers={"Host": LAN})
+    with livecam._hls_lock:
+        livecam._hls_sessions["testsid"] = {
+            "user": "admin", "camera": "guinea-pig-cage-1",
+            "quality": "sub", "metered": False, "seen": __import__("time").time(),
+        }
+    r = app.test_client().get("/hls/segment.ts?id=testsid", headers={"Host": LAN})
+    check("HLS segment refused without a livecam session", r.status_code == 401, r.status_code)
+
+    other_user = app.test_client()
+    other_user.post("/login", data={"username": "guest", "password": PASSWORD},
+                    headers={"Host": LAN})
+    r = other_user.get("/hls/segment.ts?id=testsid", headers={"Host": LAN})
+    check("HLS session belonging to another user is refused",
+          r.status_code == 403, r.status_code)
+
+    r = session_probe.get("/hls/segment.ts?id=nosuchsession", headers={"Host": LAN})
+    check("unknown HLS session id is refused", r.status_code == 403, r.status_code)
+    r = session_probe.get("/hls/segment.ts", headers={"Host": LAN})
+    check("HLS request with no session id is refused", r.status_code == 403, r.status_code)
+    r = session_probe.get("/hls/..%2Fapi%2Fstreams?id=testsid", headers={"Host": LAN})
+    check("HLS path traversal is refused", r.status_code in (400, 404), r.status_code)
+
+    r = app.test_client().get(
+        "/live/guinea-pig-cage-1/master.m3u8", headers={"Host": LAN})
+    check("HLS master requires a login", r.status_code in (302, 401), r.status_code)
+
     # --- LAN switch: ping, handoff ---
     fresh = app.test_client()
     r = fresh.get("/api/ping", headers={"Host": LAN})
@@ -284,9 +339,15 @@ def main():
     r = session_c.get("/", headers={"Host": PUB})
     check("LAN switch offer rendered on the public hostname",
           "lanToast" in r.get_data(as_text=True))
-    r = session_c.get("/", headers={"Host": LAN})
-    check("LAN switch offer absent on the LAN hostname",
-          "lanToast" not in r.get_data(as_text=True))
+    lan_c = app.test_client()
+    lan_c.post("/login", data={"username": "admin", "password": PASSWORD},
+               headers={"Host": LAN})
+    r = lan_c.get("/", headers={"Host": LAN})
+    # Assert we are looking at a real dashboard, not a login redirect --
+    # otherwise "no toast here" is true for the wrong reason.
+    check("LAN dashboard renders for a LAN-authenticated session",
+          r.status_code == 200 and "lanToast" not in r.get_data(as_text=True),
+          r.status_code)
     r = app.test_client().get("/login", headers={"Host": PUB})
     check("login page offers the switch too",
           "lanToast" in r.get_data(as_text=True))
