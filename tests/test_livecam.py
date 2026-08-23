@@ -36,12 +36,18 @@ with open(PERMS, "w") as f:
         "  purpose: metadata, not an account\n"
         "admin:\n"
         f"  password_hash: \"{{HASH}}\"\n"
-        "  cameras: [guinea-pig-cage-1, guinea-pig-cage-2]\n"
+        "  cameras: [the-boiz, the-gurlz]\n"
         "  audio: true\n"
         "  recordings: true\n"
+        # Per-camera audio, plus a camera listed for audio that this user
+        # cannot see -- audio must never be a way to reach it.
+        "partial:\n"
+        f"  password_hash: \"{{HASH}}\"\n"
+        "  cameras: [the-boiz, the-gurlz]\n"
+        "  audio: [the-boiz, baby-cam]\n"
         "guest:\n"
         f"  password_hash: \"{{HASH}}\"\n"
-        "  cameras: [guinea-pig-cage-1]\n"
+        "  cameras: [the-boiz]\n"
         "  audio: false\n"
         # A window that is already over, so "outside the window" is testable
         # without waiting for a particular time of day.
@@ -96,7 +102,7 @@ def main():
           r.status_code == 302 and "/login" in r.headers["Location"], r.status_code)
     # A <video> element must get a status, not a login page it would try to
     # decode as video.
-    r = c.get("/live/guinea-pig-cage-1?token=x", headers={"Host": PUB})
+    r = c.get("/live/the-boiz?token=x", headers={"Host": PUB})
     check("/live 401s rather than redirecting", r.status_code == 401, r.status_code)
 
     r = c.post("/login", data={"username": "admin", "password": "wrong"},
@@ -116,8 +122,9 @@ def main():
     page = r.get_data(as_text=True)
     check("dashboard renders once logged in", r.status_code == 200, r.status_code)
     check("admin sees both cameras",
-          page.count('data-camera="guinea-pig-cage-') == 4,
-          page.count('data-camera='))
+          page.count('data-camera=') == 4, page.count('data-camera='))
+    check("tiles are labelled with friendly names derived from the slug",
+          "The Boiz" in page and "The Gurlz" in page)
     check("home banner shown on the public hostname",
           'id="homeBanner"' in page and LAN in page)
     check("usage meter rendered", 'id="usage"' in page)
@@ -161,11 +168,18 @@ def main():
 
     perms = livecam.load_permissions()
     allowed, audio = livecam.check_permission("admin", perms)
-    check("admin: both cameras, audio on",
-          allowed == {"guinea-pig-cage-1", "guinea-pig-cage-2"} and audio, (allowed, audio))
+    check("admin: both cameras, audio on both (bool still means all)",
+          allowed == {"the-boiz", "the-gurlz"} and audio == allowed, (allowed, audio))
     allowed, audio = livecam.check_permission("guest", perms)
     check("guest outside their time window gets nothing",
-          allowed == set() and not audio, (allowed, audio))
+          allowed == set() and audio == set(), (allowed, audio))
+
+    # Per-camera audio, and the intersection that keeps it honest.
+    allowed, audio = livecam.check_permission("partial", perms)
+    check("per-camera audio grants only the listed camera",
+          allowed == {"the-boiz", "the-gurlz"} and audio == {"the-boiz"}, (allowed, audio))
+    check("audio listed for an unseeable camera grants nothing",
+          "baby-cam" not in audio, audio)
     check("`_`-prefixed metadata is not treated as a user",
           livecam.check_permission("_notes", perms)[0] == set())
     check("unknown user gets nothing",
@@ -193,7 +207,7 @@ def main():
     other = app.test_client()
     other.post("/login", data={"username": "guest", "password": PASSWORD},
                headers={"Host": PUB})
-    r = other.get(f"/live/guinea-pig-cage-1?token={token}", headers={"Host": PUB})
+    r = other.get(f"/live/the-boiz?token={token}", headers={"Host": PUB})
     check("a stream token is useless to another account", r.status_code == 403, r.status_code)
 
     r = c.post("/api/heartbeat", json={"token": token}, headers={"Host": PUB})
@@ -293,7 +307,7 @@ def main():
                        headers={"Host": LAN})
     with livecam._hls_lock:
         livecam._hls_sessions["testsid"] = {
-            "user": "admin", "camera": "guinea-pig-cage-1",
+            "user": "admin", "camera": "the-boiz",
             "quality": "sub", "metered": False, "seen": __import__("time").time(),
         }
     r = app.test_client().get("/hls/segment.ts?id=testsid", headers={"Host": LAN})
@@ -314,7 +328,7 @@ def main():
     check("HLS path traversal is refused", r.status_code in (400, 404), r.status_code)
 
     r = app.test_client().get(
-        "/live/guinea-pig-cage-1/master.m3u8", headers={"Host": LAN})
+        "/live/the-boiz/master.m3u8", headers={"Host": LAN})
     check("HLS master requires a login", r.status_code in (302, 401), r.status_code)
 
     # The full-quality cap counts sessions seen *recently*, not every session
@@ -327,7 +341,7 @@ def main():
         livecam._hls_sessions.clear()
         for i in range(livecam.MAX_FULL_QUALITY_SESSIONS + 2):
             livecam._hls_sessions[f"stale{i}"] = {
-                "user": "admin", "camera": "guinea-pig-cage-1", "quality": "full",
+                "user": "admin", "camera": "the-boiz", "quality": "full",
                 "metered": False, "seen": now - livecam.HLS_ACTIVE_SECONDS - 5,
             }
         stale_full = sum(
@@ -336,6 +350,48 @@ def main():
         livecam._hls_sessions.clear()
     check("sessions idle past the activity window stop counting against the cap",
           stale_full == 0, stale_full)
+
+    # --- per-camera audio, enforced server-side ---
+    # The UI hiding a control proves nothing; what matters is which go2rtc
+    # stream the server picks when a client asks for audio anyway.
+    part = app.test_client()
+    part.post("/login", data={"username": "partial", "password": PASSWORD},
+              headers={"Host": PUB})
+    ppage = part.get("/", headers={"Host": PUB}).get_data(as_text=True)
+    ptok = re.search(r'const TOKEN = "([^"]+)"', ppage).group(1)
+    check("the audio-enabled set reaches the client for per-camera UI",
+          '"the-boiz"' in ppage and "AUDIO_CAMERAS" in ppage)
+    check("permitted camera gets the audio stream when asked",
+          livecam.resolve_stream_name("the-boiz", True, "full", want_audio=True) == "the-boiz")
+    check("the other camera is refused audio despite the same request",
+          livecam.resolve_stream_name("the-gurlz", False, "full", want_audio=True)
+          == "the-gurlz_noaudio")
+    s_hls, p_hls = livecam.resolve_hls_source("the-gurlz", False, "full", want_audio=True)
+    check("same refusal over HLS (no audio track filter)", "audio" not in p_hls, p_hls)
+
+    # --- idle timeout differs by route, in the same process ---
+    with app.test_request_context("/", headers={"Host": PUB}):
+        pub_idle, pub_beat = livecam.idle_settings()
+    with app.test_request_context("/", headers={"Host": LAN}):
+        lan_idle, lan_beat = livecam.idle_settings()
+    check("LAN gets the long idle window, public keeps the short one",
+          lan_idle > pub_idle and lan_idle == 8 * 3600, (pub_idle, lan_idle))
+    check("the browser still gives up before the server on both routes",
+          pub_idle < pub_beat and lan_idle < lan_beat,
+          (pub_idle, pub_beat, lan_idle, lan_beat))
+
+    # --- back-to-live injection is HTML-only ---
+    html = b"<html><body><div id=\"root\"></div></body></html>"
+    out = livecam._inject_back_to_live(html, "text/html")
+    check("injected into HTML before </body>",
+          b"livecam-back" in out and out.endswith(b"</body></html>"))
+    check("injected outside the React root",
+          out.index(b'id="root"') < out.index(b"livecam-back"))
+    for ctype in ("text/css", "application/json", "text/plain", "video/mp4", None):
+        untouched = livecam._inject_back_to_live(html, ctype)
+        check(f"non-HTML ({ctype}) passes through byte-identical", untouched == html)
+    check("HTML without a </body> is left alone",
+          livecam._inject_back_to_live(b"partial chunk", "text/html") == b"partial chunk")
 
     # --- LAN switch: ping, handoff ---
     fresh = app.test_client()

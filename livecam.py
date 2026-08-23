@@ -92,6 +92,40 @@ HEARTBEAT_TIMEOUT_SECONDS = int(os.environ.get("HEARTBEAT_TIMEOUT_SECONDS", "600
 # stream being cut mid-request.
 IDLE_PROMPT_SECONDS = int(os.environ.get("IDLE_PROMPT_SECONDS", str(max(60, HEARTBEAT_TIMEOUT_SECONDS - 120))))
 
+# On the LAN none of the above applies: the whole point of the idle prompt is
+# that an abandoned tab quietly bills AWS egress, and LAN traffic costs
+# nothing. So the nag is pure cost with no benefit there.
+#
+# Not disabled outright, though -- an abandoned tab still holds a go2rtc
+# connection open, so 8 hours bounds that while being long enough that nobody
+# meets the dialog in practice.
+LAN_IDLE_PROMPT_SECONDS = int(os.environ.get("LAN_IDLE_PROMPT_SECONDS", str(8 * 60 * 60)))
+# The browser must give up BEFORE the server or teardown happens mid-request
+# rather than gracefully, so the two move together -- see the comment on
+# HEARTBEAT_TIMEOUT_SECONDS above.
+LAN_HEARTBEAT_TIMEOUT_SECONDS = LAN_IDLE_PROMPT_SECONDS + 600
+
+
+def idle_settings():
+    """(idle_prompt, heartbeat_timeout) for the route this request came in on."""
+    if is_public_request():
+        return IDLE_PROMPT_SECONDS, HEARTBEAT_TIMEOUT_SECONDS
+    return LAN_IDLE_PROMPT_SECONDS, LAN_HEARTBEAT_TIMEOUT_SECONDS
+
+
+def display_name(camera):
+    """Human label for a camera, derived from its slug.
+
+    Machine names have to be URL- and path-safe because they become go2rtc
+    stream names and Frigate recording directories, so the pretty form is
+    derived rather than stored: `the-boiz` -> `The Boiz`. Keeping it derived
+    means there is no second list to drift out of step as cameras are added.
+    An explicit `_display_names` map in permissions.yml overrides it for any
+    name that does not title-case well.
+    """
+    override = (load_permissions().get("_display_names") or {}).get(camera)
+    return override or camera.replace("-", " ").replace("_", " ").title()
+
 _sessions_lock = threading.Lock()
 _live_sessions = {}  # stream_token -> {"seen": epoch, "user": username}
 
@@ -444,30 +478,51 @@ def handoff():
 
 
 def check_permission(username, permissions, now=None):
-    """Return (allowed_cameras, audio_allowed) for this user right now.
+    """Return (allowed_cameras, audio_cameras) for this user right now.
 
     The time window is evaluated per request, not once at login, so a lapsed
     grant actually cuts a stream off mid-session.
+
+    `audio` may be a bool covering everything the user can see, or a list of
+    specific cameras:
+
+        audio: true                 -> audio on every permitted camera
+        audio: false                -> none
+        audio: [the-boiz, baby-cam] -> only those
+
+    The list is intersected with `cameras`, so naming a camera under `audio`
+    that the user cannot see grants nothing -- audio permission can never be
+    a way to reach a camera the allow-list withheld.
     """
     now = now or datetime.now()
     user_perms = user_entries(permissions).get(username)
     if not user_perms:
-        return set(), False
+        return set(), set()
 
     window = user_perms.get("time_window")
     if window:
         start = dtime.fromisoformat(window["start"])
         end = dtime.fromisoformat(window["end"])
         if not (start <= now.time() <= end):
-            return set(), False
+            return set(), set()
 
-    return set(user_perms.get("cameras", [])), bool(user_perms.get("audio", False))
+    cameras = set(user_perms.get("cameras", []))
+    audio = user_perms.get("audio", False)
+    if isinstance(audio, (list, tuple, set)):
+        audio_cameras = cameras & set(audio)
+    else:
+        audio_cameras = cameras if audio else set()
+    return cameras, audio_cameras
 
 
 def _prune_stale_sessions():
-    cutoff = time.time() - HEARTBEAT_TIMEOUT_SECONDS
+    # Each session carries its own timeout: a LAN viewer gets hours, a public
+    # one keeps the tight cost-control window, and both live in this same
+    # process at the same time.
+    now = time.time()
     with _sessions_lock:
-        for token in [t for t, s in _live_sessions.items() if s["seen"] < cutoff]:
+        for token in [t for t, s in _live_sessions.items()
+                      if now - s["seen"] > s.get("timeout", HEARTBEAT_TIMEOUT_SECONDS)]:
             del _live_sessions[token]
         return len(_live_sessions)
 
@@ -634,7 +689,7 @@ def live_hls(camera):
     suffix swallowed into the camera name.
     """
     username = current_user()
-    allowed_cameras, audio_allowed = check_permission(username, load_permissions())
+    allowed_cameras, audio_cameras = check_permission(username, load_permissions())
     if camera not in allowed_cameras:
         abort(403)
 
@@ -667,7 +722,7 @@ def live_hls(camera):
                      active_full)
             quality = "sub"
 
-    src, params = resolve_hls_source(camera, audio_allowed, quality, want_audio)
+    src, params = resolve_hls_source(camera, camera in audio_cameras, quality, want_audio)
     upstream = requests.get(
         f"{GO2RTC_URL}/api/stream.m3u8", params={"src": src, **params}, timeout=15
     )
@@ -753,7 +808,7 @@ def live(camera):
     username = current_user()
 
     permissions = load_permissions()
-    allowed_cameras, audio_allowed = check_permission(username, permissions)
+    allowed_cameras, audio_cameras = check_permission(username, permissions)
     if camera not in allowed_cameras:
         abort(403)
 
@@ -787,7 +842,7 @@ def live(camera):
                 _full_streams.add(stream_id)
 
     want_audio = request.args.get("audio") == "1"
-    stream = resolve_stream_name(camera, audio_allowed, quality, want_audio)
+    stream = resolve_stream_name(camera, camera in audio_cameras, quality, want_audio)
 
     upstream = requests.get(
         f"{GO2RTC_URL}/api/stream.mp4",
@@ -810,7 +865,8 @@ def live(camera):
                 with _sessions_lock:
                     entry = _live_sessions.get(token)
                     last_seen = entry["seen"] if entry else None
-                if last_seen is None or time.time() - last_seen > HEARTBEAT_TIMEOUT_SECONDS:
+                    session_timeout = (entry or {}).get("timeout", HEARTBEAT_TIMEOUT_SECONDS)
+                if last_seen is None or time.time() - last_seen > session_timeout:
                     why = "heartbeat expired"
                     break
                 still_allowed, _ = check_permission(username, load_permissions())
@@ -842,11 +898,13 @@ def dashboard():
     """livecam's own landing page: the permitted cameras, live."""
     username = current_user()
     permissions = load_permissions()
-    allowed_cameras, audio_allowed = check_permission(username, permissions)
+    allowed_cameras, audio_cameras = check_permission(username, permissions)
 
+    idle_prompt, heartbeat_timeout = idle_settings()
     token = secrets.token_urlsafe(24)
     with _sessions_lock:
-        _live_sessions[token] = {"seen": time.time(), "user": username}
+        _live_sessions[token] = {"seen": time.time(), "user": username,
+                                 "timeout": heartbeat_timeout}
     _prune_stale_sessions()
 
     used = egress_this_month()
@@ -858,10 +916,10 @@ def dashboard():
         # user would be refused.
         recordings_allowed=bool(
             user_entries(permissions).get(username, {}).get("recordings")),
-        cameras=sorted(allowed_cameras),
-        audio_allowed=audio_allowed,
+        cameras=[{"name": c, "label": display_name(c)} for c in sorted(allowed_cameras)],
+        audio_cameras=sorted(audio_cameras),
         token=token,
-        idle_prompt_seconds=IDLE_PROMPT_SECONDS,
+        idle_prompt_seconds=idle_prompt,
         egress_bytes=used,
         free_tier_bytes=FREE_TIER_BYTES,
         # There is a session here, so switching hosts needs a handoff token;
@@ -902,10 +960,47 @@ def frigate(path):
     # URLs come back rooted at /frigate rather than /.
     headers["X-Ingress-Path"] = "/frigate"
 
-    return _proxy(f"{FRIGATE_URL}/{path}", headers=headers)
+    return _proxy(f"{FRIGATE_URL}/{path}", headers=headers, inject=True)
 
 
-def _proxy(upstream_url, headers=None):
+# Frigate's own live view does not work under a subpath, which is fine --
+# livecam owns live view -- but it leaves no way back from the archive. There
+# is no Frigate setting for this, so it is injected into the HTML on the way
+# through.
+#
+# Safe because it goes in before </body> and therefore OUTSIDE <div id="root">,
+# which is the element React manages; React never sees or removes it.
+BACK_TO_LIVE_SNIPPET = """
+<a href="/" id="livecam-back" title="Back to the live view">\u2190 Live</a>
+<style>
+  #livecam-back {
+    position: fixed; left: 0; top: 50%; transform: translateY(-50%);
+    z-index: 2147483647; padding: .7rem .8rem .7rem .6rem;
+    background: #2f6fd0; color: #fff; text-decoration: none;
+    font: 600 .85rem/1 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    border-radius: 0 8px 8px 0; box-shadow: 0 2px 10px #0006;
+  }
+  #livecam-back:hover { background: #3b7ee4; }
+</style>
+"""
+
+
+def _inject_back_to_live(body, content_type):
+    """Add the back-to-live control to proxied Frigate HTML, and only to HTML.
+
+    Guarded on content-type deliberately: a blind replace across every proxied
+    response would corrupt CSS and JSON, which fail in ways that look nothing
+    like this function.
+    """
+    if "text/html" not in (content_type or "").lower():
+        return body
+    marker = b"</body>"
+    if marker not in body:
+        return body
+    return body.replace(marker, BACK_TO_LIVE_SNIPPET.encode() + marker, 1)
+
+
+def _proxy(upstream_url, headers=None, inject=False):
     upstream = requests.request(
         method=request.method,
         url=upstream_url,
@@ -919,6 +1014,8 @@ def _proxy(upstream_url, headers=None):
     excluded = {"content-encoding", "content-length", "transfer-encoding", "connection"}
     headers = [(k, v) for k, v in upstream.raw.headers.items() if k.lower() not in excluded]
     body = upstream.content
+    if inject:
+        body = _inject_back_to_live(body, upstream.headers.get("Content-Type"))
     # Recorded playback and its thumbnails are real traffic, not noise next
     # to live video, so they count when served over the public route.
     if is_public_request():

@@ -102,17 +102,17 @@
 {% if cameras %}
 <div class="grid" id="grid">
   {% for cam in cameras %}
-  <figure data-camera="{{ cam }}" tabindex="0">
+  <figure data-camera="{{ cam.name }}" tabindex="0">
     <!-- No preload="none" here. It used to be, as a bandwidth guard, but it
          is a data-saving *hint* that mobile Chrome honours far more literally
          than desktop: the tile loaded metadata, painted one frame and stopped,
          while the expanded view worked on the same phone because a tap always
          precedes it. The stream is only fetched when src is set anyway, which
          is what actually controls the bandwidth. -->
-    <video data-camera="{{ cam }}" autoplay muted playsinline
+    <video data-camera="{{ cam.name }}" autoplay muted playsinline
            disablepictureinpicture disableremoteplayback></video>
     <figcaption>
-      {{ cam }}
+      {{ cam.label }}
       <span class="badge res">&mdash;</span>
       <span class="hint">click for full quality</span>
     </figcaption>
@@ -128,20 +128,18 @@
     <strong id="overlayName"></strong>
     <span class="badge" id="overlayRes">&mdash;</span>
     <div class="right">
-      {% if audio_allowed %}
-      <!-- Sound is off until asked for, and asking is a click. That click is
-           the user gesture browsers require before they will play audible
-           media -- without it the element silently refuses to start, which
-           is exactly why this view used to sit on a frozen first frame. -->
-      <button id="soundBtn" type="button" aria-pressed="false">&#128263; Sound off</button>
+      <!-- Both are rendered because audio is granted per camera: which one
+           applies depends on which camera is expanded, not on the account.
+           Sound is off until asked for, and asking is a click -- that click
+           is the user gesture browsers require before they will play audible
+           media, without which the element silently refuses to start. -->
+      <button id="soundBtn" type="button" aria-pressed="false" hidden>&#128263; Sound off</button>
       <span id="gainWrap" hidden>
         <label for="gain">boost</label>
         <input id="gain" type="range" min="100" max="400" step="10" value="200">
         <span id="gainVal">200%</span>
       </span>
-      {% else %}
-      <span class="badge">no audio</span>
-      {% endif %}
+      <span class="badge" id="noAudioBadge" hidden>no audio</span>
       <button id="closeBtn" type="button">Close (Esc)</button>
     </div>
   </div>
@@ -174,8 +172,16 @@ const overlayVideo = document.getElementById('overlayVideo');
 const overlayName = document.getElementById('overlayName');
 const dlg = document.getElementById('idle');
 const tapToPlay = document.getElementById('tapToPlay');
+const soundBtn = document.getElementById('soundBtn');
+const noAudioBadge = document.getElementById('noAudioBadge');
+const gainWrapEl = document.getElementById('gainWrap');
 
-const AUDIO_ALLOWED = {{ audio_allowed | tojson }};
+// Audio is granted per camera, so this is a set rather than a flag -- a
+// viewer can be allowed sound on one camera and not another.
+const AUDIO_CAMERAS = new Set({{ audio_cameras | tojson }});
+const LABELS = Object.fromEntries(
+  Array.from(document.querySelectorAll('#grid figure'))
+       .map(f => [f.dataset.camera, f.querySelector('figcaption').textContent.trim()]));
 
 // iOS -- every browser on it, since they are all WebKit -- cannot play the
 // fragmented MP4 this app serves everywhere else: Safari opens a <video>
@@ -355,7 +361,21 @@ function expand(cam) {
   if (!overlay.hidden) return;
   stopTiles();
   current = cam;
-  overlayName.textContent = cam;
+  overlayName.textContent = LABELS[cam] || cam;
+  // Sound state belongs to the camera being viewed, not the session: expanding
+  // a camera without audio permission must not inherit "sound on" from the
+  // last one that had it.
+  soundOn = false;
+  const mayHearThis = AUDIO_CAMERAS.has(cam);
+  if (soundBtn) {
+    soundBtn.hidden = !mayHearThis;
+    soundBtn.classList.remove('on');
+    soundBtn.setAttribute('aria-pressed', 'false');
+    soundBtn.innerHTML = '\u{1F507} Sound off';
+  }
+  if (noAudioBadge) noAudioBadge.hidden = mayHearThis;
+  if (gainWrapEl) gainWrapEl.hidden = true;
+  overlayVideo.muted = true;
   overlay.hidden = false;
   say('');
   // Muted and audio-free by default. Sound is a separate, explicit act --
@@ -406,9 +426,8 @@ function collapse() {
 // 2. The cameras encode 8 kHz mono at a low level (peaks around -14 dB on
 //    cage 1, -35 dB on cage 2). A video element's volume caps at 1.0, so it
 //    cannot make a quiet source louder -- only a WebAudio gain stage can.
-const soundBtn = document.getElementById('soundBtn');
 if (soundBtn) {
-  const gainWrap = document.getElementById('gainWrap');
+  const gainWrap = gainWrapEl;
   const gainInput = document.getElementById('gain');
   const gainVal = document.getElementById('gainVal');
   let ctx = null, gainNode = null;
