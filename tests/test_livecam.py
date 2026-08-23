@@ -515,6 +515,38 @@ def main():
     check("config-flag gate: only the-boiz is actually declared PTZ-capable",
           livecam.ptz_capable_cameras() == {"the-boiz"}, livecam.ptz_capable_cameras())
 
+    # Regression: a real deploy hit exactly this. The volume mount's
+    # host-side file did not exist yet when the container was created, so
+    # Docker silently bind-mounted an empty directory in its place, and
+    # open() raised IsADirectoryError -- a shape load_camera_config() did
+    # not originally handle, which took down the *entire* dashboard (every
+    # route calls it, not just PTZ) over a feature meant to be optional and
+    # inert. A malformed CAMERAS_FILE must degrade to "no PTZ", not 500.
+    saved_cameras_file = livecam.CAMERAS_FILE
+    broken_path = os.path.join(WORK, "cameras_is_a_directory.yml")
+    os.makedirs(broken_path, exist_ok=True)
+    livecam.CAMERAS_FILE = broken_path
+    check("a directory where the file should be degrades to no PTZ cameras",
+          livecam.load_camera_config() == {})
+    dash_after_break = part.get("/", headers={"Host": LAN})
+    check("the dashboard survives a broken CAMERAS_FILE rather than 500ing",
+          dash_after_break.status_code == 200, dash_after_break.status_code)
+
+    with open(os.path.join(WORK, "cameras_not_yaml.yml"), "w") as f:
+        f.write("this: is: not: valid: yaml: [[[")
+    livecam.CAMERAS_FILE = f.name
+    check("invalid YAML degrades to no PTZ cameras rather than raising",
+          livecam.load_camera_config() == {})
+
+    with open(os.path.join(WORK, "cameras_wrong_shape.yml"), "w") as f:
+        f.write("cameras: \"not a mapping\"\n")
+    livecam.CAMERAS_FILE = f.name
+    check("a non-mapping `cameras:` value degrades to no PTZ cameras",
+          livecam.load_camera_config() == {})
+
+    livecam.CAMERAS_FILE = saved_cameras_file
+    check("restored config still works: the real fixture is back", livecam.load_camera_config())
+
     r = part.post("/ptz/the-boiz", json={"command": "move_up"}, headers={"Host": LAN})
     check("PTZ move accepted: both gates satisfied", r.status_code == 200, r.status_code)
     check("ContinuousMove reached the fake camera with the right velocity",

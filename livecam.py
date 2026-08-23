@@ -311,16 +311,43 @@ def load_camera_config():
     """PTZ-capable cameras and their ONVIF connection details.
 
     Read fresh on every call, like load_permissions() -- a camera can be
-    added without restarting the container. Missing file or empty content
-    both mean "no PTZ cameras configured," which is the expected state
-    until real hardware exists.
+    added without restarting the container.
+
+    Deliberately fails open to "no PTZ cameras configured" for ANY read
+    problem, not just a missing file. A live deploy hit exactly this: the
+    volume mount's host-side file did not exist yet when the container was
+    created, so Docker silently bind-mounted an empty directory in its
+    place, and `open()` raised IsADirectoryError -- an error shape this
+    function did not originally handle, which took down the *entire*
+    dashboard (every route calls this, not just the PTZ ones) over a
+    feature that is supposed to be optional and inert until real hardware
+    exists. A malformed or wrong-type config file for an add-on capability
+    must never be able to break the rest of the app; logging a warning and
+    treating it as "no PTZ" is the honest degraded state, not a 500.
     """
     try:
         with open(CAMERAS_FILE) as f:
             data = yaml.safe_load(f) or {}
     except FileNotFoundError:
+        # The expected steady state until real PTZ hardware exists -- not
+        # worth a log line every time it's read.
         return {}
-    return data.get("cameras") or {}
+    except OSError:
+        # A directory where a file should be, permissions, anything else --
+        # unexpected, so worth a log line, but degrades the same way as a
+        # missing file rather than taking the app down over an add-on
+        # feature that is supposed to be optional.
+        log.warning("cameras config unreadable at %s", CAMERAS_FILE, exc_info=True)
+        return {}
+    except yaml.YAMLError:
+        log.warning("cameras config is not valid YAML at %s", CAMERAS_FILE, exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        log.warning("cameras config at %s is not a mapping (got %s)",
+                   CAMERAS_FILE, type(data).__name__)
+        return {}
+    cameras = data.get("cameras") or {}
+    return cameras if isinstance(cameras, dict) else {}
 
 
 def ptz_capable_cameras():
