@@ -102,6 +102,42 @@ failures = []
 
 
 # --------------------------------------------------------------------------
+# Fake upstream for _proxy(): mimics just enough of a requests.Response for
+# the code to work against, so the streaming-vs-buffering branch in _proxy()
+# can be tested directly rather than inferred. `.content` and `.iter_content`
+# both record whether they were called -- the streaming fix is precisely the
+# claim that non-HTML responses never touch `.content`, so that claim gets
+# checked directly instead of assumed from the response looking correct.
+# --------------------------------------------------------------------------
+class _FakeRaw:
+    def __init__(self, headers):
+        self.headers = headers
+
+
+class FakeUpstreamResponse:
+    def __init__(self, status_code, content_type, chunks):
+        self.status_code = status_code
+        self._chunks = list(chunks)
+        self.headers = {"Content-Type": content_type}
+        self.raw = _FakeRaw(dict(self.headers))
+        self.closed = False
+        self.content_accessed = False
+        self.iter_content_calls = 0
+
+    @property
+    def content(self):
+        self.content_accessed = True
+        return b"".join(self._chunks)
+
+    def iter_content(self, chunk_size=None):
+        self.iter_content_calls += 1
+        yield from self._chunks
+
+    def close(self):
+        self.closed = True
+
+
+# --------------------------------------------------------------------------
 # Fake ONVIF stack: no PTZ camera exists to test against, so this exercises
 # every layer around the real ONVIF I/O (routing, both permission gates, the
 # asyncio bridge that actually runs coroutines on livecam's background loop
@@ -338,6 +374,81 @@ def main():
           "/frigate/" not in denied.get("/", headers={"Host": PUB}).get_data(as_text=True))
     check("the archive link is shown to users with the grant",
           "/frigate/" in page)
+
+    # --- _proxy() streaming: the actual bug behind intermittent iOS freezes
+    # while scrubbing recorded video. Frigate's HLS VOD segments run 8+ MB
+    # each, and scrubbing abandons and refetches rapidly; the previous
+    # implementation fully buffered every response (`upstream.content`)
+    # before responding, so an abandoned client's request still downloaded
+    # the whole thing from Frigate regardless -- confirmed live by closing a
+    # real client connection 4KB into an 8.4MB segment and finding livecam's
+    # own access log showed a completed 200 for the full size anyway.
+    #
+    # These tests check the mechanism directly rather than inferring it: a
+    # fake upstream records whether `.content` (buffers everything) or
+    # `.iter_content` (streams, and stops early if the caller stops asking
+    # for more) actually gets used.
+    real_requests_request = livecam.requests.request
+    try:
+        # Non-HTML: must stream. A real recorded segment is binary and large;
+        # this uses multiple chunks the way a real 8MB+ segment would arrive
+        # in 64KB pieces, not because the size matters here.
+        seg_chunks = [b"S" * 70000, b"E" * 70000, b"G" * 12345]
+        fake_seg = FakeUpstreamResponse(200, "video/mp4", seg_chunks)
+        livecam.requests.request = lambda *a, **kw: fake_seg
+        r = c.get("/frigate/vod/the-boiz/start/0/end/1/seg-1.m4s", headers={"Host": PUB})
+        check("streamed response is byte-identical to the source",
+              r.data == b"".join(seg_chunks), len(r.data))
+        check("non-HTML never touches .content -- proves it took the streaming path, not the old buffering one",
+              fake_seg.content_accessed is False)
+        check("non-HTML is read via iter_content exactly once",
+              fake_seg.iter_content_calls == 1, fake_seg.iter_content_calls)
+        check("the upstream connection is closed once streaming finishes",
+              fake_seg.closed is True)
+
+        # HTML: must still buffer, because the back-to-live injection needs
+        # the whole body to find </body>. The one deliberate exception to
+        # the streaming rule above, and it needs to still work.
+        html_body = b"<html><body><div id=\"root\">frigate ui</div></body></html>"
+        fake_html = FakeUpstreamResponse(200, "text/html; charset=utf-8", [html_body])
+        livecam.requests.request = lambda *a, **kw: fake_html
+        r = c.get("/frigate/", headers={"Host": PUB})
+        check("HTML still gets buffered (.content used) so injection can find </body>",
+              fake_html.content_accessed is True)
+        check("HTML back-to-live injection still fires through the real route, not just the helper",
+              b"livecam-back" in r.data)
+        check("injected HTML is still well-formed around the marker",
+              r.data.endswith(b"</body></html>"))
+
+        # Egress accounting must still be correct on both paths -- the whole
+        # point of counting is knowing what actually crossed the public
+        # route, and that must not regress when the mechanism changes.
+        livecam.record_egress(0, flush=True)
+        before_seg = livecam.egress_this_month()
+        fake_seg2 = FakeUpstreamResponse(200, "video/mp4", seg_chunks)
+        livecam.requests.request = lambda *a, **kw: fake_seg2
+        # .data forces full consumption of the streamed response -- without
+        # it the test client may only pull the generator far enough to get
+        # headers, under-running the egress count for a reason that has
+        # nothing to do with _proxy() itself (caught by this test failing
+        # with exactly one chunk's worth counted instead of all three).
+        c.get("/frigate/vod/the-boiz/start/0/end/1/seg-2.m4s", headers={"Host": PUB}).data
+        livecam.record_egress(0, flush=True)
+        check("egress counted for a streamed response matches the real byte count",
+              livecam.egress_this_month() - before_seg == len(b"".join(seg_chunks)),
+              livecam.egress_this_month() - before_seg)
+
+        # The LAN hostname must stay free either way -- same rule as every
+        # other metered path in this app.
+        before_lan = livecam.egress_this_month()
+        fake_seg3 = FakeUpstreamResponse(200, "video/mp4", seg_chunks)
+        livecam.requests.request = lambda *a, **kw: fake_seg3
+        c.get("/frigate/vod/the-boiz/start/0/end/1/seg-3.m4s", headers={"Host": LAN}).data
+        livecam.record_egress(0, flush=True)
+        check("streamed responses over the LAN hostname are not metered",
+              livecam.egress_this_month() == before_lan, livecam.egress_this_month())
+    finally:
+        livecam.requests.request = real_requests_request
 
     livecam.record_egress(0, flush=True)
     before = livecam.egress_this_month()

@@ -1300,15 +1300,53 @@ def _proxy(upstream_url, headers=None, inject=False):
         stream=True,
     )
     excluded = {"content-encoding", "content-length", "transfer-encoding", "connection"}
-    headers = [(k, v) for k, v in upstream.raw.headers.items() if k.lower() not in excluded]
-    body = upstream.content
-    if inject:
-        body = _inject_back_to_live(body, upstream.headers.get("Content-Type"))
+    resp_headers = [(k, v) for k, v in upstream.raw.headers.items() if k.lower() not in excluded]
+    content_type = upstream.headers.get("Content-Type", "")
     # Recorded playback and its thumbnails are real traffic, not noise next
     # to live video, so they count when served over the public route.
-    if is_public_request():
-        record_egress(len(body))
-    return Response(body, upstream.status_code, headers)
+    metered = is_public_request()
+
+    # HTML is the one case that needs the whole body up front: finding
+    # </body> to inject the back-to-live control can't work on a partial
+    # chunk. HTML pages here are tens of KB, never the multi-megabyte media
+    # this function otherwise proxies, so buffering only this case is cheap.
+    if inject and "text/html" in content_type.lower():
+        body = _inject_back_to_live(upstream.content, content_type)
+        upstream.close()
+        if metered:
+            record_egress(len(body))
+        return Response(body, upstream.status_code, resp_headers)
+
+    # Everything else streams -- this is the fix for a real bug. Frigate's
+    # recorded-video HLS segments run 8+ MB each (10s at full resolution),
+    # and scrubbing the timeline is an abandon-and-refetch pattern: every
+    # drag cancels the in-flight segment fetch and starts a new one at the
+    # new position. The previous behaviour (buffer the whole body, then
+    # respond) meant an abandoned request kept downloading from Frigate
+    # regardless of whether the client was still there -- proven by testing
+    # it directly: closing a client connection 4KB into an 8.4MB segment
+    # still logged a completed 200 for the full size. Under real scrubbing,
+    # enough of these pile up to starve gunicorn's thread pool and Frigate's
+    # own transcoder, which is what produced the intermittent iOS freezes
+    # (iOS's native HLS player is markedly more aggressive than desktop/
+    # Android about firing a fresh segment request per seek).
+    #
+    # Streaming means the generator -- and therefore the upstream fetch --
+    # stops as soon as gunicorn notices the client is gone, the same
+    # reasoning already relied on for live video in /live/<camera>'s
+    # pump(). Not a new technique, just applied to a second code path.
+    def relay():
+        try:
+            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                if metered:
+                    record_egress(len(chunk))
+                yield chunk
+        finally:
+            upstream.close()
+            if metered:
+                record_egress(0, flush=True)
+
+    return Response(stream_with_context(relay()), upstream.status_code, resp_headers)
 
 
 if __name__ == "__main__":
