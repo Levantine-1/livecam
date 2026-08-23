@@ -21,6 +21,7 @@ sys.path.insert(0, REPO)
 
 WORK = tempfile.mkdtemp(prefix="livecam-test-")
 PERMS = os.path.join(WORK, "permissions.yml")
+CAMERAS = os.path.join(WORK, "cameras.yml")
 DB = os.path.join(WORK, "egress.db")
 
 # Both users share one hash so the fixture needs only one known password;
@@ -39,12 +40,16 @@ with open(PERMS, "w") as f:
         "  cameras: [the-boiz, the-gurlz]\n"
         "  audio: true\n"
         "  recordings: true\n"
-        # Per-camera audio, plus a camera listed for audio that this user
-        # cannot see -- audio must never be a way to reach it.
+        # Per-camera audio AND ptz, plus a camera listed for each that this
+        # user cannot see -- neither grant may become a way to reach it.
         "partial:\n"
         f"  password_hash: \"{{HASH}}\"\n"
         "  cameras: [the-boiz, the-gurlz]\n"
         "  audio: [the-boiz, baby-cam]\n"
+        # the-gurlz is granted ptz here but NOT declared PTZ-capable in the
+        # cameras.yml fixture below -- exercises the "both gates required"
+        # property: a permission grant alone must not be enough.
+        "  ptz: [the-boiz, the-gurlz, baby-cam]\n"
         "guest:\n"
         f"  password_hash: \"{{HASH}}\"\n"
         "  cameras: [the-boiz]\n"
@@ -54,6 +59,17 @@ with open(PERMS, "w") as f:
         "  time_window: {start: \"00:00:00\", end: \"00:00:01\"}\n"
     )
 
+# Only the-boiz is declared PTZ-capable -- the-gurlz deliberately is not,
+# even though `partial` above is granted `ptz` on both, so the config-flag
+# gate has something real to refuse.
+with open(CAMERAS, "w") as f:
+    f.write(
+        "cameras:\n"
+        "  the-boiz:\n"
+        "    ip: 10.69.69.107\n"
+        "    onvif_port: 8899\n"
+    )
+
 PUB = "livecam.levantine.io"
 LAN = "livecam-lan.levantine.io"
 
@@ -61,10 +77,13 @@ os.environ.update(
     FRIGATE_URL="http://frigate.invalid:5000",
     GO2RTC_URL="http://go2rtc.invalid:1984",
     PERMISSIONS_FILE=PERMS,
+    CAMERAS_FILE=CAMERAS,
     EGRESS_DB=DB,
     FLASK_SECRET_KEY="test-secret",
     PUBLIC_HOSTNAME=PUB,
     LAN_HOSTNAME=LAN,
+    CAMERA_USERNAME="admin",
+    CAMERA_PASSWORD="test-camera-password",
 )
 
 import livecam  # noqa: E402  (must follow the env setup above)
@@ -80,6 +99,85 @@ with open(PERMS, "w") as f:
 
 app = livecam.app
 failures = []
+
+
+# --------------------------------------------------------------------------
+# Fake ONVIF stack: no PTZ camera exists to test against, so this exercises
+# every layer around the real ONVIF I/O (routing, both permission gates, the
+# asyncio bridge that actually runs coroutines on livecam's background loop
+# and returns real results) while replacing only the network calls
+# themselves. Shaped to match onvif-zeep-async's real return types closely
+# enough for livecam's code to work unmodified against either.
+# --------------------------------------------------------------------------
+class _FakePTZConfig:
+    def __init__(self):
+        self.DefaultContinuousPanTiltVelocitySpace = object()
+        self.DefaultContinuousZoomVelocitySpace = object()
+
+
+class _FakeProfile:
+    def __init__(self, token):
+        self.token = token
+        self.PTZConfiguration = _FakePTZConfig()
+
+
+class _FakeMoveRequest:
+    def __init__(self):
+        self.ProfileToken = None
+        self.Velocity = None
+
+
+class _FakePreset:
+    def __init__(self, name, token):
+        self.Name = name
+        self.token = token
+
+
+class FakePTZService:
+    def __init__(self):
+        self.calls = []  # (method, profile_token, payload) for assertions
+
+    def create_type(self, name):
+        if name != "ContinuousMove":
+            raise NotImplementedError(name)
+        return _FakeMoveRequest()
+
+    async def ContinuousMove(self, req):
+        self.calls.append(("ContinuousMove", req.ProfileToken, req.Velocity))
+
+    async def Stop(self, req):
+        self.calls.append(("Stop", req["ProfileToken"], req))
+
+    async def GotoPreset(self, req):
+        self.calls.append(("GotoPreset", req["ProfileToken"], req["PresetToken"]))
+
+    async def GetPresets(self, req):
+        return [_FakePreset("Home", "preset-home"), _FakePreset("Garden", "preset-garden")]
+
+
+class _FakeMediaService:
+    async def GetProfiles(self):
+        return [_FakeProfile("profile-1")]
+
+
+class FakeONVIFCamera:
+    """Replaces onvif.ONVIFCamera. Records constructor args for auth checks."""
+
+    instances = []
+
+    def __init__(self, host, port, user, passwd):
+        self.host, self.port, self.user, self.passwd = host, port, user, passwd
+        self.ptz_service = FakePTZService()
+        FakeONVIFCamera.instances.append(self)
+
+    async def update_xaddrs(self):
+        pass
+
+    async def create_media_service(self):
+        return _FakeMediaService()
+
+    async def create_ptz_service(self):
+        return self.ptz_service
 
 
 def check(name, condition, detail=""):
@@ -167,19 +265,23 @@ def main():
           "TRANSPORT_TIMEOUT_MS" in page and "_abandonStream" in page)
 
     perms = livecam.load_permissions()
-    allowed, audio = livecam.check_permission("admin", perms)
+    allowed, audio, ptz = livecam.check_permission("admin", perms)
     check("admin: both cameras, audio on both (bool still means all)",
           allowed == {"the-boiz", "the-gurlz"} and audio == allowed, (allowed, audio))
-    allowed, audio = livecam.check_permission("guest", perms)
+    check("admin has no ptz grant at all (never set for this user)",
+          ptz == set(), ptz)
+    allowed, audio, ptz = livecam.check_permission("guest", perms)
     check("guest outside their time window gets nothing",
-          allowed == set() and audio == set(), (allowed, audio))
+          allowed == set() and audio == set() and ptz == set(), (allowed, audio, ptz))
 
-    # Per-camera audio, and the intersection that keeps it honest.
-    allowed, audio = livecam.check_permission("partial", perms)
+    # Per-camera audio and ptz, and the intersection that keeps both honest.
+    allowed, audio, ptz = livecam.check_permission("partial", perms)
     check("per-camera audio grants only the listed camera",
           allowed == {"the-boiz", "the-gurlz"} and audio == {"the-boiz"}, (allowed, audio))
     check("audio listed for an unseeable camera grants nothing",
           "baby-cam" not in audio, audio)
+    check("ptz listed for an unseeable camera grants nothing either",
+          ptz == {"the-boiz", "the-gurlz"} and "baby-cam" not in ptz, ptz)
     check("`_`-prefixed metadata is not treated as a user",
           livecam.check_permission("_notes", perms)[0] == set())
     check("unknown user gets nothing",
@@ -392,6 +494,80 @@ def main():
         check(f"non-HTML ({ctype}) passes through byte-identical", untouched == html)
     check("HTML without a </body> is left alone",
           livecam._inject_back_to_live(b"partial chunk", "text/html") == b"partial chunk")
+
+    # --- PTZ: talks straight to the camera, never touches Frigate ---
+    livecam.ONVIFCamera = FakeONVIFCamera  # patch before any PTZ route runs
+
+    part = app.test_client()
+    part.post("/login", data={"username": "partial", "password": PASSWORD},
+              headers={"Host": LAN})
+
+    # `partial` is granted ptz on the-boiz AND the-gurlz, but only the-boiz
+    # is declared PTZ-capable -- the value that actually reaches the client
+    # must be the intersection of both, not either gate alone.
+    dash_html = part.get("/", headers={"Host": LAN}).get_data(as_text=True)
+    check("both gates intersected correctly reach the client",
+          "PTZ_CAMERAS = new Set([\"the-boiz\"])" in dash_html, dash_html.count("the-boiz"))
+
+    allowed, _, ptz_cameras = livecam.check_permission("partial", livecam.load_permissions())
+    check("ptz grant intersected with cameras (baby-cam unseeable, dropped)",
+          ptz_cameras == {"the-boiz", "the-gurlz"}, ptz_cameras)
+    check("config-flag gate: only the-boiz is actually declared PTZ-capable",
+          livecam.ptz_capable_cameras() == {"the-boiz"}, livecam.ptz_capable_cameras())
+
+    r = part.post("/ptz/the-boiz", json={"command": "move_up"}, headers={"Host": LAN})
+    check("PTZ move accepted: both gates satisfied", r.status_code == 200, r.status_code)
+    check("ContinuousMove reached the fake camera with the right velocity",
+          FakeONVIFCamera.instances[-1].ptz_service.calls[-1]
+          == ("ContinuousMove", "profile-1", {"PanTilt": {"x": 0, "y": 0.5}}))
+    check("ONVIFCamera constructed with this camera's declared host/port",
+          (FakeONVIFCamera.instances[-1].host, FakeONVIFCamera.instances[-1].port)
+          == ("10.69.69.107", 8899))
+    check("no per-camera username override -> falls back to CAMERA_USERNAME",
+          FakeONVIFCamera.instances[-1].user == "admin")
+
+    r = part.post("/ptz/the-boiz", json={"command": "stop"}, headers={"Host": LAN})
+    check("PTZ stop accepted", r.status_code == 200, r.status_code)
+    check("Stop reached the fake camera",
+          FakeONVIFCamera.instances[-1].ptz_service.calls[-1][0] == "Stop")
+
+    r = part.post("/ptz/the-gurlz", json={"command": "move_up"}, headers={"Host": LAN})
+    check("permission grant alone is not enough: the-gurlz has no config entry",
+          r.status_code == 403, r.status_code)
+
+    other = app.test_client()
+    other.post("/login", data={"username": "guest", "password": PASSWORD},
+               headers={"Host": LAN})
+    guest_html = other.get("/", headers={"Host": LAN}).get_data(as_text=True)
+    check("guest has no ptz grant at all: dashboard shows an empty PTZ_CAMERAS",
+          "PTZ_CAMERAS = new Set([])" in guest_html)
+    r = other.post("/ptz/the-boiz", json={"command": "move_up"}, headers={"Host": LAN})
+    check("config flag alone is not enough: guest has no ptz grant for the-boiz",
+          r.status_code == 403, r.status_code)
+
+    r = app.test_client().post("/ptz/the-boiz", json={"command": "move_up"}, headers={"Host": LAN})
+    check("PTZ requires a session at all", r.status_code == 401, r.status_code)
+
+    r = part.post("/ptz/the-boiz", json={"command": "spin_wildly"}, headers={"Host": LAN})
+    check("an unrecognised command is refused, not silently ignored",
+          r.status_code == 400, r.status_code)
+
+    presets_before = len(FakeONVIFCamera.instances)
+    r = part.get("/ptz/the-boiz/presets", headers={"Host": LAN})
+    check("presets endpoint returns the fake camera's real preset list",
+          r.status_code == 200 and sorted(r.json["presets"]) == ["garden", "home"], r.json)
+    check("preset fetch reuses the cached ONVIF client rather than reconnecting",
+          len(FakeONVIFCamera.instances) == presets_before)
+
+    r = part.post("/ptz/the-boiz", json={"command": "preset_home"}, headers={"Host": LAN})
+    check("a real preset name resolves and issues GotoPreset", r.status_code == 200, r.status_code)
+    check("GotoPreset used the real token from GetPresets, not the name itself",
+          FakeONVIFCamera.instances[-1].ptz_service.calls[-1]
+          == ("GotoPreset", "profile-1", "preset-home"))
+
+    r = part.post("/ptz/the-boiz", json={"command": "preset_nonexistent"}, headers={"Host": LAN})
+    check("an unknown preset name is refused server-side, not trusted from the request",
+          r.status_code == 400, r.status_code)
 
     # --- LAN switch: ping, handoff ---
     fresh = app.test_client()

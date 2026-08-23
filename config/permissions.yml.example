@@ -1,42 +1,53 @@
 # Admin-edited directly -- copy to permissions.yml and fill in real users.
 # No UI for this; it's a handful of family accounts, not worth building one.
 #
-# This file is both the account list and the permission list. A user exists
-# because they appear here with a `password_hash`; there is no separate user
-# store and no self-registration.
+# This file is the whole account system: a user exists because they appear
+# here with a `password_hash`. There is no self-registration and no
+# separate account system -- livecam is the only login. Frigate's own auth
+# is disabled in favour of proxy authentication instead.
 #
 # Generate a hash (never commit the password itself):
 #
 #   python3 -c "from werkzeug.security import generate_password_hash as h; \
 #               import getpass; print(h(getpass.getpass()))"
 #
-# These livecam accounts are separate from ZoneMinder's own accounts. ZM
-# still prompts for its own login when someone opens recordings & settings.
+# pbkdf2 rather than werkzeug's newer scrypt default, purely for
+# portability: a hash written by whatever werkzeug is installed on the
+# machine generating it has to be verifiable by whatever version the
+# container image happens to pull.
 #
-# Keys starting with `_` are metadata, not users. _monitor_id_to_name maps
-# ZM's numeric Monitor IDs (assigned when each Monitor is created, see
-# ansible/roles/applications/camera_nvr) to the camera names used in each
-# user's `cameras` list below.
-_monitor_id_to_name:
-  1: guinea-pig-cage-1
-  2: guinea-pig-cage-2
+# Camera names must match the go2rtc/Frigate camera names exactly (see the
+# ansible repo's group_vars/Frigate) -- a name that doesn't match silently
+# removes that camera from everyone's access rather than erroring.
 
-# Example user -- full access, all hours.
+# Example user -- full access, all hours, plus the recorded archive.
 alice:
   password_hash: "pbkdf2:sha256:600000$REPLACE$ME"
   cameras:
-    - guinea-pig-cage-1
-    - guinea-pig-cage-2
+    - the-boiz
+    - the-gurlz
+  # true = every camera above; false = none; or a list of specific cameras,
+  # intersected with `cameras` so naming one you can't see grants nothing.
   audio: true
+  # Same shape as `audio`, and for the same reason: a camera can grant PTZ
+  # without audio or vice versa. Also requires that camera to be declared
+  # in cameras.yml -- both are independent gates, neither alone is enough.
+  ptz: false
+  # Frigate's timeline, scrubbing and export. All-or-nothing: Frigate has
+  # no per-camera gating that matches this file's model, so anyone granted
+  # this sees every camera's recordings.
+  recordings: true
 
-# Example user -- one camera, no audio, daytime only. The window is
+# Example user -- one camera, no audio, no PTZ, daytime only. The window is
 # re-checked while a stream runs, so it cuts a live view off at 20:00
 # rather than only refusing a new one.
 bob:
   password_hash: "pbkdf2:sha256:600000$REPLACE$ME"
   cameras:
-    - guinea-pig-cage-1
+    - the-boiz
   audio: false
+  ptz: false
+  recordings: false
   time_window:
     start: "08:00:00"
     end: "20:00:00"

@@ -57,6 +57,25 @@
   .tap { display:block; width:calc(100% - 2rem); margin:1rem; padding:.9rem 1rem;
          border:0; border-radius:8px; background:#2f6fd0; color:#fff;
          font-size:1rem; font-weight:600; cursor:pointer; }
+  #ptzPad[hidden] { display:none; }
+  #ptzPad { position:absolute; right:1rem; bottom:1rem; z-index:55;
+            display:flex; flex-direction:column; align-items:center; gap:.6rem;
+            padding:.7rem; background:#1c1f26cc; border-radius:12px;
+            backdrop-filter:blur(4px); }
+  .ptzDpad { display:grid; grid-template-columns:repeat(3,2.4rem); grid-template-rows:repeat(3,2.4rem);
+             gap:.25rem; }
+  .ptzDpad button:nth-child(1) { grid-column:2; grid-row:1; }
+  .ptzDpad button:nth-child(2) { grid-column:1; grid-row:2; }
+  .ptzDpad button:nth-child(3) { grid-column:3; grid-row:2; }
+  .ptzDpad button:nth-child(4) { grid-column:2; grid-row:3; }
+  .ptzZoom { display:flex; gap:.4rem; }
+  .ptzBtn { width:2.4rem; height:2.4rem; border:0; border-radius:8px; background:#2a2f3a;
+            color:#e8eaed; font-size:1.1rem; cursor:pointer; touch-action:none;
+            user-select:none; -webkit-user-select:none; }
+  .ptzBtn:hover, .ptzBtn:active { background:#3d4757; }
+  #ptzPresets { width:100%; background:#2a2f3a; color:#e8eaed; border:0;
+                border-radius:6px; padding:.35rem; font-size:.8rem; }
+  #ptzPresets[hidden] { display:none; }
 </style>
 </head>
 <body>
@@ -146,6 +165,26 @@
   <!-- Always starts muted, exactly like the tiles that have always worked. -->
   <video id="overlayVideo" autoplay playsinline muted></video>
   <p class="notice" id="overlayNotice" hidden></p>
+
+  <!-- Rendered unconditionally, like the sound button above -- shown or
+       hidden per expanded camera in JS, since PTZ is granted per camera,
+       not per account. On every camera today this stays hidden: PTZ_CAMERAS
+       is empty until a real PTZ camera exists and is both declared in
+       cameras.yml AND granted to this user, so this markup costs nothing
+       to ship ahead of having hardware to control. -->
+  <div id="ptzPad" hidden>
+    <div class="ptzDpad">
+      <button type="button" class="ptzBtn" data-cmd="move_up" aria-label="Tilt up">&#9650;</button>
+      <button type="button" class="ptzBtn" data-cmd="move_left" aria-label="Pan left">&#9664;</button>
+      <button type="button" class="ptzBtn" data-cmd="move_right" aria-label="Pan right">&#9654;</button>
+      <button type="button" class="ptzBtn" data-cmd="move_down" aria-label="Tilt down">&#9660;</button>
+    </div>
+    <div class="ptzZoom">
+      <button type="button" class="ptzBtn" data-cmd="zoom_out" aria-label="Zoom out">&minus;</button>
+      <button type="button" class="ptzBtn" data-cmd="zoom_in" aria-label="Zoom in">+</button>
+    </div>
+    <select id="ptzPresets" hidden></select>
+  </div>
 </div>
 
 <dialog id="idle">
@@ -175,10 +214,17 @@ const tapToPlay = document.getElementById('tapToPlay');
 const soundBtn = document.getElementById('soundBtn');
 const noAudioBadge = document.getElementById('noAudioBadge');
 const gainWrapEl = document.getElementById('gainWrap');
+const ptzPad = document.getElementById('ptzPad');
+const ptzPresetsEl = document.getElementById('ptzPresets');
 
 // Audio is granted per camera, so this is a set rather than a flag -- a
 // viewer can be allowed sound on one camera and not another.
 const AUDIO_CAMERAS = new Set({{ audio_cameras | tojson }});
+// Same shape for PTZ, and for the same reason. Empty on every camera today
+// -- see livecam.py's ptz_capable_cameras()/check_permission() for the two
+// independent gates (a config flag AND a permission grant) that both have
+// to be true before a camera ever lands in this set.
+const PTZ_CAMERAS = new Set({{ ptz_cameras | tojson }});
 const LABELS = Object.fromEntries(
   Array.from(document.querySelectorAll('#grid figure'))
        .map(f => [f.dataset.camera, f.querySelector('figcaption').textContent.trim()]));
@@ -376,6 +422,9 @@ function expand(cam) {
   if (noAudioBadge) noAudioBadge.hidden = mayHearThis;
   if (gainWrapEl) gainWrapEl.hidden = true;
   overlayVideo.muted = true;
+  const canPtz = PTZ_CAMERAS.has(cam);
+  ptzPad.hidden = !canPtz;
+  if (canPtz) ptzLoadPresets(cam); else { ptzPresetsEl.hidden = true; ptzPresetsEl.innerHTML = ''; }
   overlay.hidden = false;
   say('');
   // Muted and audio-free by default. Sound is a separate, explicit act --
@@ -411,6 +460,11 @@ function collapse() {
   if (overlay.hidden) return;
   clearInterval(stallTimer); stallTimer = null;
   stopVideo(overlayVideo);
+  // Safety net: closing the view while a direction is still held (Esc mid-
+  // press, a tab switch that eats the pointerup) must not leave a real
+  // camera creeping after the UI it was controlled from is gone.
+  ptzStopActive();
+  ptzPad.hidden = true;
   overlay.hidden = true;
   say('');
   current = null;
@@ -471,6 +525,73 @@ if (soundBtn) {
     if (current) loadOverlay(current, currentQuality, soundOn);
   });
 }
+
+// --- PTZ ------------------------------------------------------------------
+// Talks straight to POST /ptz/<camera>, which talks straight to the camera
+// over ONVIF -- Frigate is not involved in this at all, the same way it is
+// not involved in live view. Hold-to-move: pointerdown sends the direction,
+// pointerup/pointerleave sends stop. ONVIF's ContinuousMove keeps a camera
+// moving until told to stop, so the release side of this is not optional --
+// without it a dropped pointerup would leave a real camera creeping
+// indefinitely, which is why there is also a watchdog below.
+let ptzActiveCamera = null;
+let ptzWatchdog = null;
+
+async function ptzSend(cam, command) {
+  try {
+    await fetch(`/ptz/${encodeURIComponent(cam)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command }),
+    });
+  } catch (e) { /* transient network blip; releasing the button still sends stop */ }
+}
+
+function ptzStopActive() {
+  clearTimeout(ptzWatchdog); ptzWatchdog = null;
+  if (ptzActiveCamera) { ptzSend(ptzActiveCamera, 'stop'); ptzActiveCamera = null; }
+}
+
+function ptzStart(cam, command) {
+  ptzStopActive();
+  ptzActiveCamera = cam;
+  ptzSend(cam, command);
+  // A held button with no matching release (a dropped pointerup, a pointer
+  // captured by something else, an app switch on mobile) must not leave the
+  // camera moving forever -- auto-stop after 2s of continuous hold.
+  ptzWatchdog = setTimeout(ptzStopActive, 2000);
+}
+
+document.querySelectorAll('.ptzBtn').forEach(btn => {
+  const cmd = btn.dataset.cmd;
+  const start = e => { e.preventDefault(); if (current) ptzStart(current, cmd); };
+  const stop = () => ptzStopActive();
+  btn.addEventListener('pointerdown', start);
+  btn.addEventListener('pointerup', stop);
+  btn.addEventListener('pointerleave', stop);
+  btn.addEventListener('pointercancel', stop);
+});
+
+async function ptzLoadPresets(cam) {
+  ptzPresetsEl.hidden = true;
+  ptzPresetsEl.innerHTML = '';
+  try {
+    const r = await fetch(`/ptz/${encodeURIComponent(cam)}/presets`);
+    if (!r.ok) return;
+    const { presets } = await r.json();
+    if (!presets || !presets.length) return;
+    const blank = new Option('Presets…', '', true, true);
+    blank.disabled = true;
+    ptzPresetsEl.add(blank);
+    presets.forEach(name => ptzPresetsEl.add(new Option(name, name)));
+    ptzPresetsEl.hidden = false;
+  } catch (e) { /* no presets shown is a safe fallback */ }
+}
+
+ptzPresetsEl.addEventListener('change', () => {
+  if (current && ptzPresetsEl.value) ptzSend(current, `preset_${ptzPresetsEl.value}`);
+  ptzPresetsEl.selectedIndex = 0;
+});
 
 // Esc and the close button both go through history.back(), so every exit
 // path pops the same entry and the history stays consistent.

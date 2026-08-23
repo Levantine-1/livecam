@@ -1,0 +1,35 @@
+# Admin-edited directly -- copy to cameras.yml and fill in real PTZ
+# hardware. Deliberately separate from permissions.yml: that file is about
+# who may see what, this one is camera wiring (an IP and a port), and
+# mixing the two would mean a permissions edit could accidentally touch
+# camera config or vice versa.
+#
+# A camera absent here has no PTZ regardless of what any user's `ptz:`
+# grant in permissions.yml says; a user without that grant can't control a
+# camera that IS declared here either. Both are required.
+#
+# Independent of Frigate entirely -- PTZ control talks straight to the
+# camera over ONVIF, the same way live view already bypasses Frigate via
+# go2rtc. Nothing here depends on Frigate being up or aware this camera
+# exists.
+#
+# Camera names must match go2rtc/Frigate camera names exactly (see the
+# ansible repo's group_vars/Frigate) and the names used in permissions.yml.
+#
+# Empty by default -- this repo currently has no PTZ hardware to test
+# against. The port and shared-credential assumption below are both
+# documented guesses, not verified facts:
+cameras:
+  city-view-1:
+    ip: 10.69.69.150
+    # Common default for this camera family's web UI; NOT verified against
+    # any specific PTZ model -- confirm against the real camera once
+    # purchased. If it's wrong, PTZ commands will fail to connect and the
+    # error will be specific about it (see livecam's logs).
+    onvif_port: 80
+    # Optional per-camera override. Omit to fall back to
+    # CAMERA_USERNAME/CAMERA_PASSWORD -- the same RTSP admin account
+    # already used for streaming, which is assumed (not confirmed) to also
+    # work for ONVIF on this camera family.
+    # username: admin
+    # password: something-camera-specific

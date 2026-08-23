@@ -3,3 +3,4 @@ gunicorn
 requests
 pyyaml
 itsdangerous
+onvif-zeep-async

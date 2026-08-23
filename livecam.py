@@ -19,12 +19,21 @@ and required a second login of its own.
 
 On top of that, this app enforces what the backends have no concept of:
 per-user camera lists, a per-user time-of-day window, true per-user audio
-gating, and a separate grant for the recorded archive.
+gating, a separate grant for the recorded archive, and (for cameras that
+support it) PTZ control.
+
+PTZ is deliberately NOT routed through Frigate. Live view already bypasses
+it entirely -- video comes straight from go2rtc talking to the camera's own
+RTSP endpoint -- and camera control follows the same "direct to camera"
+half of the app via ONVIF, rather than adding a dependency on Frigate being
+up, configured, or even aware a given camera exists.
 
 Neither backend is reachable from outside the LAN; only this app is. So the
-permission checks can't be bypassed by hitting go2rtc or Frigate directly.
+permission checks can't be bypassed by hitting go2rtc, Frigate, or a camera
+directly.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -40,6 +49,7 @@ import yaml
 from flask import (Flask, Response, abort, jsonify, redirect, render_template,
                    request, session, stream_with_context, url_for)
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from onvif import ONVIFCamera
 from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
@@ -64,6 +74,19 @@ app.config.update(
 FRIGATE_URL = os.environ["FRIGATE_URL"].rstrip("/")
 GO2RTC_URL = os.environ["GO2RTC_URL"].rstrip("/")
 PERMISSIONS_FILE = os.environ.get("PERMISSIONS_FILE", "/app/config/permissions.yml")
+# Which cameras support PTZ and how to reach them over ONVIF. Deliberately a
+# separate file from permissions.yml -- that file is about who may see what,
+# this one is infrastructure (an IP and a port), and conflating the two would
+# mean a permissions edit could accidentally touch camera wiring or vice
+# versa. Empty/absent entries are the common case: today's fleet has no PTZ
+# hardware, so this file is expected to declare nothing.
+CAMERAS_FILE = os.environ.get("CAMERAS_FILE", "/app/config/cameras.yml")
+# Assumed to be the same admin account already used for RTSP on this camera
+# family -- unverified until a real PTZ camera confirms it. If a camera ever
+# needs a separate ONVIF account, that becomes a per-camera override in
+# CAMERAS_FILE rather than a second pair of these.
+CAMERA_USERNAME = os.environ.get("CAMERA_USERNAME")
+CAMERA_PASSWORD = os.environ.get("CAMERA_PASSWORD")
 
 # Which hostname served this request decides two things: whether to nudge the
 # viewer towards the LAN URL, and whether the bytes count as billable AWS
@@ -284,6 +307,33 @@ def load_permissions():
         return yaml.safe_load(f) or {}
 
 
+def load_camera_config():
+    """PTZ-capable cameras and their ONVIF connection details.
+
+    Read fresh on every call, like load_permissions() -- a camera can be
+    added without restarting the container. Missing file or empty content
+    both mean "no PTZ cameras configured," which is the expected state
+    until real hardware exists.
+    """
+    try:
+        with open(CAMERAS_FILE) as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    return data.get("cameras") or {}
+
+
+def ptz_capable_cameras():
+    """Camera names with PTZ config declared -- the config-side gate.
+
+    Independent of any user's `ptz` permission grant: both are required.
+    A camera absent here has no PTZ regardless of what any permissions.yml
+    entry says, and a user without the grant can't control a camera that
+    is present here either.
+    """
+    return set(load_camera_config())
+
+
 def user_entries(permissions):
     """The user records in permissions.yml, minus the `_`-prefixed metadata."""
     return {
@@ -477,42 +527,46 @@ def handoff():
     return redirect("/")
 
 
+def _intersect_grant(cameras, value):
+    """Resolve a true/false/list-shaped grant against the cameras a user may see.
+
+    Shared by `audio` and `ptz`, which both follow the same shape:
+
+        true                 -> every permitted camera
+        false                -> none
+        [the-boiz, baby-cam] -> only those, intersected with `cameras`
+
+    The intersection is the load-bearing part: naming a camera under either
+    grant that the user cannot see must grant nothing. Neither can become a
+    way to reach a camera the allow-list withheld.
+    """
+    if isinstance(value, (list, tuple, set)):
+        return cameras & set(value)
+    return set(cameras) if value else set()
+
+
 def check_permission(username, permissions, now=None):
-    """Return (allowed_cameras, audio_cameras) for this user right now.
+    """Return (allowed_cameras, audio_cameras, ptz_cameras) for this user right now.
 
     The time window is evaluated per request, not once at login, so a lapsed
-    grant actually cuts a stream off mid-session.
-
-    `audio` may be a bool covering everything the user can see, or a list of
-    specific cameras:
-
-        audio: true                 -> audio on every permitted camera
-        audio: false                -> none
-        audio: [the-boiz, baby-cam] -> only those
-
-    The list is intersected with `cameras`, so naming a camera under `audio`
-    that the user cannot see grants nothing -- audio permission can never be
-    a way to reach a camera the allow-list withheld.
+    grant actually cuts a stream (or PTZ control) off mid-session.
     """
     now = now or datetime.now()
     user_perms = user_entries(permissions).get(username)
     if not user_perms:
-        return set(), set()
+        return set(), set(), set()
 
     window = user_perms.get("time_window")
     if window:
         start = dtime.fromisoformat(window["start"])
         end = dtime.fromisoformat(window["end"])
         if not (start <= now.time() <= end):
-            return set(), set()
+            return set(), set(), set()
 
     cameras = set(user_perms.get("cameras", []))
-    audio = user_perms.get("audio", False)
-    if isinstance(audio, (list, tuple, set)):
-        audio_cameras = cameras & set(audio)
-    else:
-        audio_cameras = cameras if audio else set()
-    return cameras, audio_cameras
+    audio_cameras = _intersect_grant(cameras, user_perms.get("audio", False))
+    ptz_cameras = _intersect_grant(cameras, user_perms.get("ptz", False))
+    return cameras, audio_cameras, ptz_cameras
 
 
 def _prune_stale_sessions():
@@ -673,7 +727,7 @@ def _authorise_hls(session_id):
         entry["seen"] = time.time()
         camera, metered = entry["camera"], entry["metered"]
 
-    allowed, _ = check_permission(current_user(), load_permissions())
+    allowed, _, _ = check_permission(current_user(), load_permissions())
     if camera not in allowed:
         abort(403)
     return camera, metered
@@ -689,7 +743,7 @@ def live_hls(camera):
     suffix swallowed into the camera name.
     """
     username = current_user()
-    allowed_cameras, audio_cameras = check_permission(username, load_permissions())
+    allowed_cameras, audio_cameras, _ = check_permission(username, load_permissions())
     if camera not in allowed_cameras:
         abort(403)
 
@@ -808,7 +862,7 @@ def live(camera):
     username = current_user()
 
     permissions = load_permissions()
-    allowed_cameras, audio_cameras = check_permission(username, permissions)
+    allowed_cameras, audio_cameras, _ = check_permission(username, permissions)
     if camera not in allowed_cameras:
         abort(403)
 
@@ -869,7 +923,7 @@ def live(camera):
                 if last_seen is None or time.time() - last_seen > session_timeout:
                     why = "heartbeat expired"
                     break
-                still_allowed, _ = check_permission(username, load_permissions())
+                still_allowed, _, _ = check_permission(username, load_permissions())
                 if camera not in still_allowed:
                     why = "permission revoked"
                     break
@@ -892,13 +946,219 @@ def live(camera):
     return resp
 
 
+# --------------------------------------------------------------------------
+# PTZ -- direct ONVIF control, deliberately bypassing Frigate
+#
+# Live view already talks straight to the camera (via go2rtc's RTSP pull);
+# PTZ follows the same pattern rather than adding a dependency on Frigate
+# being up, configured, or even aware a given camera supports PTZ.
+#
+# onvif-zeep-async is asyncio-native; this app's gunicorn workers are sync
+# (gthread). Bridged the same way Frigate itself bridges its own onvif
+# controller into its sync-facing API: one dedicated background thread
+# running a single persistent event loop, with requests scheduled onto it
+# via run_coroutine_threadsafe() and blocked on for the (sub-second)
+# result. A persistent loop -- not one per request -- is what lets the
+# ONVIFCamera/profile/PTZ-service objects be created once per camera and
+# reused, avoiding the GetProfiles/update_xaddrs handshake on every button
+# press, which would make a control that needs to feel like a joystick
+# feel like a page load instead.
+#
+# Started lazily on first use, not at import time: on every host running
+# this today, no camera declares PTZ, so the loop and its thread would
+# otherwise sit idle forever for a feature nobody can use yet.
+# --------------------------------------------------------------------------
+
+_ptz_loop = None
+_ptz_loop_ready = threading.Event()
+_ptz_start_lock = threading.Lock()
+
+# Connected clients, keyed by camera name. Written to and read from
+# exclusively by coroutines running on _ptz_loop -- that loop runs one
+# coroutine at a time, so it is its own serialization and this dict needs
+# no separate lock, unlike the plain dicts/sets shared across worker
+# threads elsewhere in this file.
+_ptz_clients = {}
+
+# Matches the fixed speed Frigate's own onvif.py uses for continuous moves
+# (0.5 on a -1..1 axis) -- a reasonable middle speed, not something either
+# codebase measured against real hardware.
+_PTZ_VELOCITY = {
+    "move_up": {"PanTilt": {"x": 0, "y": 0.5}},
+    "move_down": {"PanTilt": {"x": 0, "y": -0.5}},
+    "move_left": {"PanTilt": {"x": -0.5, "y": 0}},
+    "move_right": {"PanTilt": {"x": 0.5, "y": 0}},
+    "zoom_in": {"Zoom": {"x": 0.5}},
+    "zoom_out": {"Zoom": {"x": -0.5}},
+}
+
+
+def _ptz_loop_main():
+    global _ptz_loop
+    _ptz_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_ptz_loop)
+    _ptz_loop_ready.set()
+    _ptz_loop.run_forever()
+
+
+def _run_ptz(coro, timeout=10):
+    """Run a coroutine on the dedicated PTZ event loop; block for its result."""
+    with _ptz_start_lock:
+        if _ptz_loop is None:
+            threading.Thread(target=_ptz_loop_main, name="ptz-loop", daemon=True).start()
+            if not _ptz_loop_ready.wait(timeout=5):
+                raise RuntimeError("PTZ event loop failed to start")
+    return asyncio.run_coroutine_threadsafe(coro, _ptz_loop).result(timeout=timeout)
+
+
+async def _get_ptz_client(camera):
+    """(ptz_service, profile_token, presets) for `camera`, connecting once and caching.
+
+    Must only run on the PTZ event loop thread -- see the _ptz_clients
+    comment above for why that alone is enough synchronization.
+    """
+    cached = _ptz_clients.get(camera)
+    if cached:
+        return cached
+
+    config = load_camera_config().get(camera) or {}
+    host = config.get("ip") or config.get("host")
+    if not host:
+        raise LookupError(f"{camera} has no ip/host in {CAMERAS_FILE}")
+    port = config.get("onvif_port", 80)
+    # Per-camera override wins; otherwise the assumed-shared RTSP account.
+    # See the CAMERA_USERNAME/CAMERA_PASSWORD comment near the top of this
+    # file -- unverified until real hardware confirms the assumption.
+    username = config.get("username", CAMERA_USERNAME)
+    password = config.get("password", CAMERA_PASSWORD)
+
+    cam = ONVIFCamera(host, port, username, password)
+    await cam.update_xaddrs()
+    media = await cam.create_media_service()
+    profiles = await media.GetProfiles()
+    # Same selection rule as Frigate's own onvif.py: the first profile that
+    # actually declares continuous PTZ support, not just any profile.
+    profile = next(
+        (
+            p for p in profiles
+            if p.PTZConfiguration
+            and (
+                p.PTZConfiguration.DefaultContinuousPanTiltVelocitySpace is not None
+                or p.PTZConfiguration.DefaultContinuousZoomVelocitySpace is not None
+            )
+        ),
+        None,
+    )
+    if profile is None:
+        raise LookupError(f"{camera} has no ONVIF media profile with PTZ support")
+
+    ptz = await cam.create_ptz_service()
+
+    presets = {}
+    try:
+        preset_list = await ptz.GetPresets({"ProfileToken": profile.token})
+        presets = {p.Name.lower(): p.token for p in preset_list if p.Name}
+    except Exception:
+        # Not every PTZ camera implements presets; absence isn't an error,
+        # it just means the preset dropdown has nothing to show.
+        log.warning("ptz presets unavailable camera=%s", camera, exc_info=True)
+
+    client = {"ptz": ptz, "profile_token": profile.token, "presets": presets}
+    _ptz_clients[camera] = client
+    return client
+
+
+async def _ptz_command(camera, command):
+    client = await _get_ptz_client(camera)
+    ptz, token = client["ptz"], client["profile_token"]
+
+    if command == "stop":
+        await ptz.Stop({"ProfileToken": token, "PanTilt": True, "Zoom": True})
+        return
+
+    if command.startswith("preset_"):
+        preset_token = client["presets"].get(command[len("preset_"):])
+        if preset_token is None:
+            raise LookupError(f"no such preset for {camera}: {command}")
+        await ptz.GotoPreset({"ProfileToken": token, "PresetToken": preset_token})
+        return
+
+    velocity = _PTZ_VELOCITY.get(command)
+    if velocity is None:
+        raise ValueError(f"unknown ptz command: {command}")
+    # ContinuousMove keeps moving until Stop -- the client is responsible for
+    # sending stop on release, which is exactly the hold-to-move UI this is
+    # built for.
+    move = ptz.create_type("ContinuousMove")
+    move.ProfileToken = token
+    move.Velocity = velocity
+    await ptz.ContinuousMove(move)
+
+
+def _authorise_ptz(camera):
+    """Both gates, in one place: the permission grant AND the config flag.
+
+    A camera not declared in CAMERAS_FILE has no PTZ regardless of any
+    user's grant; a user without the grant can't control a camera that is
+    declared. Neither alone is enough.
+    """
+    _, _, ptz_cameras = check_permission(current_user(), load_permissions())
+    if camera not in (ptz_cameras & ptz_capable_cameras()):
+        abort(403)
+
+
+@app.route("/ptz/<camera>", methods=["POST"])
+@login_required
+def ptz_control(camera):
+    _authorise_ptz(camera)
+
+    command = (request.get_json(silent=True) or {}).get("command")
+    if not command:
+        abort(400)
+
+    try:
+        _run_ptz(_ptz_command(camera, command))
+    except LookupError as e:
+        log.warning("ptz command refused camera=%s command=%s: %s", camera, command, e)
+        abort(400)
+    except ValueError:
+        abort(400)
+    except Exception:
+        log.exception("ptz command failed camera=%s command=%s", camera, command)
+        abort(502)
+
+    return jsonify({"ok": True})
+
+
+@app.route("/ptz/<camera>/presets")
+@login_required
+def ptz_presets(camera):
+    _authorise_ptz(camera)
+
+    try:
+        client = _run_ptz(_get_ptz_client(camera))
+    except LookupError as e:
+        log.warning("ptz presets refused camera=%s: %s", camera, e)
+        abort(400)
+    except Exception:
+        log.exception("ptz presets failed camera=%s", camera)
+        abort(502)
+
+    return jsonify({"presets": sorted(client["presets"])})
+
+
 @app.route("/")
 @login_required
 def dashboard():
     """livecam's own landing page: the permitted cameras, live."""
     username = current_user()
     permissions = load_permissions()
-    allowed_cameras, audio_cameras = check_permission(username, permissions)
+    allowed_cameras, audio_cameras, ptz_cameras = check_permission(username, permissions)
+    # Two independent gates, both required: the permission grant above, and
+    # a camera actually being declared PTZ-capable in CAMERAS_FILE. Today's
+    # fleet declares none, so this is always empty regardless of any user's
+    # `ptz:` grant -- the feature is inert until real hardware exists.
+    controllable_cameras = ptz_cameras & ptz_capable_cameras()
 
     idle_prompt, heartbeat_timeout = idle_settings()
     token = secrets.token_urlsafe(24)
@@ -918,6 +1178,7 @@ def dashboard():
             user_entries(permissions).get(username, {}).get("recordings")),
         cameras=[{"name": c, "label": display_name(c)} for c in sorted(allowed_cameras)],
         audio_cameras=sorted(audio_cameras),
+        ptz_cameras=sorted(controllable_cameras),
         token=token,
         idle_prompt_seconds=idle_prompt,
         egress_bytes=used,

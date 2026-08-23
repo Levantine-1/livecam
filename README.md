@@ -45,6 +45,8 @@ What this app adds on top of the backends:
   that tears down abandoned tabs.
 - An **egress counter** and a **"you're at home" banner**, both described
   below.
+- **PTZ control**, for cameras that support it -- talking straight to the
+  camera over ONVIF, described below.
 
 ## Accounts
 
@@ -119,6 +121,36 @@ excluded, which is the whole point of the number.
   services on the host egress too, so this is a **lower bound** on the real
   bill. Camera video dwarfs the rest here, which is what makes it useful.
 
+## PTZ
+
+Deliberately **not** routed through Frigate, even though Frigate has its own ONVIF/PTZ support.
+Live view already bypasses Frigate entirely -- video comes straight from go2rtc talking to the
+camera's own RTSP endpoint -- and PTZ follows that same "direct to camera" half of the app, over
+ONVIF, via [`onvif-zeep-async`](https://pypi.org/project/onvif-zeep-async/) (the same library
+Frigate's own implementation uses internally, confirmed by reading `frigate/ptz/onvif.py` off the
+deployed image rather than the docs, which were thin on exact call shapes). Nothing here depends
+on Frigate being up, configured, or even aware a given camera supports PTZ.
+
+ONVIF's `ContinuousMove`/`Stop` model is a natural fit for a hold-to-move UI: `pointerdown` sends
+a direction, `pointerup` sends stop. Because `onvif-zeep-async` is asyncio-native and this app's
+gunicorn workers are sync (`gthread`), PTZ requests are bridged onto one dedicated background
+thread running a persistent event loop -- the same pattern Frigate itself uses to bridge its own
+onvif controller into a sync-facing API. A persistent loop, not one per request, is what lets the
+ONVIF connection and profile token be created once per camera and reused, rather than paying a
+full handshake on every button press.
+
+**Two independent gates**, both required before a camera's controls appear or a command is
+accepted: a `ptz:` grant in `permissions.yml` (same `true`/`false`/`[camera, ...]` shape as
+`audio`, intersected with `cameras` the same way), and the camera actually being declared in
+`config/cameras.yml` (deployed separately from `permissions.yml` -- see that file's own header).
+Today's fleet declares no PTZ cameras, so the feature ships completely inert: no controls render,
+`POST /ptz/<camera>` refuses everything, regardless of any permission grant.
+
+**Unverified until real hardware exists**: the ONVIF port, and whether the RTSP admin account
+(`CAMERA_USERNAME`/`CAMERA_PASSWORD`, reused from the same Vault secret as streaming) also
+authenticates ONVIF on this camera family. Both are documented assumptions in `cameras.yml`'s
+example, not tested facts -- confirm them against the real camera before relying on this.
+
 ## Deploy
 
 Same pattern as `thisper`: push to `master`, `.github/workflows/deploy.yml`
@@ -139,6 +171,8 @@ its env vars, Vault-injected secrets and volumes are declared.
 | `PUBLIC_HOSTNAME` | Hostname that routes via AWS; drives the banner and what counts as egress |
 | `LAN_HOSTNAME` | Hostname that stays on the LAN; the banner's link target |
 | `PERMISSIONS_FILE` | Per-user permission config (default `/app/config/permissions.yml`), see `config/permissions.yml.example` |
+| `CAMERAS_FILE` | PTZ-capable cameras and their ONVIF details (default `/app/config/cameras.yml`) -- empty until real hardware exists |
+| `CAMERA_USERNAME` / `CAMERA_PASSWORD` | Assumed-shared account for ONVIF, reusing the RTSP credentials already in Vault at `kv/data/cameras/amcrest` -- overridable per camera in `CAMERAS_FILE` |
 | `FLASK_SECRET_KEY` | Flask session secret -- from Vault, `kv/data/livecam/admin` |
 | `EGRESS_DB` | SQLite path for the egress counter (default `/app/data/egress.db`) |
 | `FREE_TIER_BYTES` | Free-tier allowance the meter is drawn against (default 100 GB) |
