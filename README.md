@@ -1,20 +1,24 @@
 # livecam
 
-The front door to the camera stack on the `cameras` VM (see the `camera_nvr`
+The front door to the camera stack on the `frigate` VM (see the `frigate`
 role in the ansible repo), which is split across two backends:
-[ZoneMinder](https://zoneminder.com/) does recording, storage and recorded
-playback, while [go2rtc](https://github.com/AlexxIT/go2rtc) serves live view
-by remuxing the camera stream without decoding it. ZM's own live path is
-deliberately unused -- it decodes every frame and pinned the NVR box hard
-enough to need a power cycle.
+[Frigate](https://frigate.video/) does recording, retention, the scrub
+timeline and export, while [go2rtc](https://github.com/AlexxIT/go2rtc)
+serves live view by remuxing the camera stream without decoding it. Frigate
+ships that go2rtc and records through it, so one connection per camera
+serves both jobs.
+
+This replaced ZoneMinder, which recorded correctly but was event-oriented
+rather than timeline-oriented -- no continuous scrub bar, no live previews
+on the console -- and needed a second login of its own.
 
 Neither backend is reachable from outside the LAN. Only this app is, so its
-checks cannot be sidestepped by hitting go2rtc or ZoneMinder directly.
+checks cannot be sidestepped by hitting go2rtc or Frigate directly.
 
 What this app adds on top of the backends:
 
 - Its **own login**, and its own dashboard of live tiles. Everyday viewing
-  never touches ZoneMinder's UI, which matters because most of the people
+  never touches Frigate's UI, which matters because most of the people
   using this are not technical.
 - A per-user **time-of-day viewing window**, re-checked continuously while a
   stream is running -- not just at login -- so a window closing mid-view
@@ -44,22 +48,21 @@ What this app adds on top of the backends:
 
 ## Accounts
 
-Two logins per person, on purpose:
+**One login per person.** livecam authenticates, and Frigate's own login is
+disabled in favour of proxy authentication -- livecam passes the username on
+in `X-Forwarded-User`, which Frigate trusts because it is reachable only on
+the LAN. ZoneMinder needed a second account per person; this does not.
 
-1. **livecam's own account** -- what the dashboard uses. Nothing here is
-   reachable without it, including the proxied ZoneMinder console.
-2. **ZoneMinder's account** -- prompted for separately when someone opens
-   *recordings & settings*. ZM keeps its own account system and its own
-   native per-user monitor permissions; this app does not try to replace or
-   bridge them.
+Access to the recorded archive is a **separate grant** (`recordings: true`)
+from live viewing. Frigate has no per-camera or per-audio gating matching
+this app's model -- anyone who reaches it sees every camera and hears
+recorded audio -- so a user allowed one camera, or no audio, must not simply
+inherit the archive. It is off by default.
 
 An earlier version had no accounts of its own and instead resolved a
-forwarded `ZMSESSID` cookie back to a ZM username by reading ZM's `Sessions`
-table and regex-matching PHP's session serialization. That is gone. It was
-fragile (the serialization format is version-specific, and the first version
-of the regex silently matched nothing, making every request look logged
-out), it forced everyone through ZM's login page first, and it never
-reliably carried a session through the proxy anyway.
+forwarded `ZMSESSID` cookie back to a ZoneMinder username by reading its
+`Sessions` table and regex-matching PHP's session serialization. That is
+gone, along with ZoneMinder itself.
 
 Accounts are provisioned by hand -- there are a handful of family users and
 no self-registration. Users live in `permissions.yml` (deployed by the
@@ -131,8 +134,8 @@ its env vars, Vault-injected secrets and volumes are declared.
 
 | Var | Purpose |
 |---|---|
-| `ZM_BACKEND_URL` | ZoneMinder on the `cameras` VM -- recorded playback only |
-| `GO2RTC_URL` | go2rtc on the `cameras` VM -- live view only |
+| `FRIGATE_URL` | Frigate on the `frigate` VM -- recordings, timeline, export |
+| `GO2RTC_URL` | go2rtc (bundled with Frigate) -- live view only |
 | `PUBLIC_HOSTNAME` | Hostname that routes via AWS; drives the banner and what counts as egress |
 | `LAN_HOSTNAME` | Hostname that stays on the LAN; the banner's link target |
 | `PERMISSIONS_FILE` | Per-user permission config (default `/app/config/permissions.yml`), see `config/permissions.yml.example` |
@@ -144,9 +147,11 @@ its env vars, Vault-injected secrets and volumes are declared.
 | `HANDOFF_MAX_AGE_SECONDS` | Validity window for a single-use public->LAN session handoff token (default 60) |
 | `SESSION_COOKIE_SECURE` | Off by default: plain HTTP to this container is a supported path (nginx-proxy runs `HTTPS_METHOD=noredirect`, and the AWS relay arrives over HTTP), and setting it without that being true end to end makes login loop silently |
 
-## Still unverified
+## Known caveat
 
-- `ZM_MEDIA_PATTERNS` in `livecam.py` -- the exact URL shape of ZM's
-  event-clip endpoints, which determines whether a recorded-media request
-  gets gated at all. The live path (`nph-zms`) is not used by this app's own
-  dashboard, only reachable through the proxied ZM console.
+Frigate is served under `/frigate/` via `X-Ingress-Path`. Frigate documents
+that **its own go2rtc live streams do not work under a subpath** -- which is
+fine here precisely because livecam owns live view and Frigate is wanted for
+recordings, scrubbing and export. If that ever bites, the fallback is a
+dedicated `frigate-lan.levantine.io` vhost on `service` alongside the
+livecam one.

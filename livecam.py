@@ -1,29 +1,28 @@
 """
-livecam -- a thin gate in front of the camera stack.
+livecam -- the front door to the camera stack.
 
-Two backends, deliberately split by what each is good at:
+Two backends on the frigate VM, deliberately split by what each is good at:
 
-  * ZoneMinder  -- recorded playback. It hands over the stored mp4 and the
-                   browser decodes it, so this costs the server nothing.
-  * go2rtc      -- live view. It remuxes the camera's existing H.264 without
-                   decoding, which is why live view is cheap. ZoneMinder's
-                   own live path decodes every frame and is explicitly NOT
-                   used here -- it pinned the NVR box hard enough to need a
-                   power cycle.
+  * go2rtc  -- live view. It remuxes the camera's existing H.264 without
+               decoding, which is why live view is cheap.
+  * Frigate -- recording, retention, the scrub timeline and export. It
+               ships the go2rtc above and records through it, so one
+               connection per camera serves both jobs.
 
-livecam owns the front door. Users log in here, against accounts declared in
-permissions.yml, and only then is ZoneMinder reachable at all -- ZM then asks
-for its own account, so a person has two logins. That is deliberate: ZM is
-the admin/recordings tool and its account system stays untouched, while the
-everyday live-view path belongs to this app and to non-technical family
-members who should never have to meet ZM's UI.
+livecam owns authentication. Users log in here, against accounts declared
+in permissions.yml, and Frigate's own login is disabled in favour of proxy
+authentication -- livecam passes the username on. One account per person.
 
-On top of ZM's native per-user monitor permissions, this app adds the two
-things ZM has no concept of: a per-user time-of-day window, and true
-per-user audio gating.
+This replaced ZoneMinder, which recorded correctly but was event-oriented
+rather than timeline-oriented (no continuous scrub bar, no live previews)
+and required a second login of its own.
+
+On top of that, this app enforces what the backends have no concept of:
+per-user camera lists, a per-user time-of-day window, true per-user audio
+gating, and a separate grant for the recorded archive.
 
 Neither backend is reachable from outside the LAN; only this app is. So the
-permission checks can't be bypassed by hitting go2rtc or ZM directly.
+permission checks can't be bypassed by hitting go2rtc or Frigate directly.
 """
 
 import logging
@@ -62,7 +61,7 @@ app.config.update(
     in ("1", "true", "yes"),
 )
 
-ZM_BACKEND_URL = os.environ["ZM_BACKEND_URL"].rstrip("/")
+FRIGATE_URL = os.environ["FRIGATE_URL"].rstrip("/")
 GO2RTC_URL = os.environ["GO2RTC_URL"].rstrip("/")
 PERMISSIONS_FILE = os.environ.get("PERMISSIONS_FILE", "/app/config/permissions.yml")
 
@@ -101,15 +100,6 @@ _live_sessions = {}  # stream_token -> {"seen": epoch, "user": username}
 # never counted -- they are cheap enough that grid viewing never needs
 # capping.
 _full_streams = set()
-
-# Only these carry actual video/audio. Everything else passes through to ZM
-# untouched. Verify against the installed ZM version -- these were written
-# without a live ZM to test against.
-ZM_MEDIA_PATTERNS = (
-    re.compile(r"/zm/cgi-bin/nph-zms"),
-    re.compile(r"/zm/index\.php.*view=(image|video)"),
-)
-
 
 # --------------------------------------------------------------------------
 # Egress accounting
@@ -863,6 +853,11 @@ def dashboard():
     return render_template(
         "index.html",
         username=username,
+        # Whether to offer the recorded archive at all. Same grant the
+        # /frigate/ route enforces, so the link never points somewhere the
+        # user would be refused.
+        recordings_allowed=bool(
+            user_entries(permissions).get(username, {}).get("recordings")),
         cameras=sorted(allowed_cameras),
         audio_allowed=audio_allowed,
         token=token,
@@ -879,62 +874,53 @@ def dashboard():
     )
 
 
-@app.route("/<path:path>", methods=["GET", "POST"])
+@app.route("/frigate/", defaults={"path": ""}, methods=["GET", "POST"])
+@app.route("/frigate/<path:path>", methods=["GET", "POST"])
 @login_required
-def gate(path):
-    """Everything else: ZoneMinder, with recorded media gated the same way.
+def frigate(path):
+    """Frigate's UI: recordings, the scrub timeline, and export.
 
-    Login-gated as a whole, so ZoneMinder is not reachable at all without a
-    livecam session -- ZM's own login then sits behind this one.
+    Frigate replaced ZoneMinder, which recorded correctly but had no
+    continuous scrub bar and no live previews. Live view is still not its
+    job -- livecam serves that from go2rtc directly.
+
+    Access is a separate grant from live viewing. Frigate has no per-camera
+    or per-audio gating that matches this app's model: anyone who reaches
+    it sees every camera and hears recorded audio. So a user who is allowed
+    one camera, or no audio, must not simply inherit the archive.
     """
-    full_path = "/" + path
-    upstream_url = ZM_BACKEND_URL + full_path
-
-    if not any(p.search(full_path) for p in ZM_MEDIA_PATTERNS):
-        return _proxy(upstream_url)
-
-    username = current_user()
-    permissions = load_permissions()
-    allowed_cameras, audio_allowed = check_permission(username, permissions)
-
-    # YAML parses `1: guinea-pig-cage-1` with an *integer* key, while the
-    # query string yields the string "1", so a direct lookup never matched
-    # and every recorded clip fell through to the id itself -- which is
-    # never a camera name, so playback was refused for everyone. Failing
-    # closed hid it; normalising the keys is the actual fix.
-    monitor_id = request.args.get("monitor")
-    id_to_name = {
-        str(k): v for k, v in (permissions.get("_monitor_id_to_name") or {}).items()
-    }
-    camera_name = id_to_name.get(str(monitor_id), monitor_id)
-    if camera_name not in allowed_cameras:
+    if not user_entries(load_permissions()).get(current_user(), {}).get("recordings"):
         abort(403)
 
-    # Recorded events are muxed by ZoneMinder with whatever the camera sent,
-    # so audio can't be selected away the way it is for live. Users without
-    # audio permission are refused recorded playback rather than handed a
-    # stream they shouldn't hear -- deliberately failing closed.
-    if not audio_allowed:
-        abort(403)
+    # Frigate's own login is disabled; it trusts this header instead, which
+    # is what keeps livecam the single login rather than repeating ZM's two
+    # separate accounts. Reachable only on the LAN, so nothing outside can
+    # set the header itself.
+    headers = {k: v for k, v in request.headers if k.lower() not in ("host", "x-forwarded-user")}
+    headers["X-Forwarded-User"] = current_user()
+    # How Frigate is told it lives under a prefix, so its own asset and API
+    # URLs come back rooted at /frigate rather than /.
+    headers["X-Ingress-Path"] = "/frigate"
 
-    return _proxy(upstream_url)
+    return _proxy(f"{FRIGATE_URL}/{path}", headers=headers)
 
 
-def _proxy(upstream_url):
+def _proxy(upstream_url, headers=None):
     upstream = requests.request(
         method=request.method,
         url=upstream_url,
         params=request.args,
-        headers={k: v for k, v in request.headers if k.lower() != "host"},
+        headers=headers or {k: v for k, v in request.headers if k.lower() != "host"},
         data=request.get_data(),
         cookies=request.cookies,
         allow_redirects=False,
+        stream=True,
     )
     excluded = {"content-encoding", "content-length", "transfer-encoding", "connection"}
     headers = [(k, v) for k, v in upstream.raw.headers.items() if k.lower() not in excluded]
     body = upstream.content
-    # ZoneMinder's console alone pulls 33 sub-resources per page, so proxied
-    # traffic is not noise next to the video when viewed remotely.
+    # Recorded playback and its thumbnails are real traffic, not noise next
+    # to live video, so they count when served over the public route.
     if is_public_request():
         record_egress(len(body))
     return Response(body, upstream.status_code, headers)

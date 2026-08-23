@@ -3,7 +3,7 @@
 Deliberately covers the parts where a bug is silent rather than loud: a
 permission that fails open, a stream token that works for the wrong user,
 the egress counter charging LAN traffic. Both backends are pointed at
-unroutable hosts, so nothing here touches ZoneMinder or go2rtc -- every
+unroutable hosts, so nothing here touches Frigate or go2rtc -- every
 assertion is about this app's own decisions.
 
     pip install flask pyyaml requests
@@ -31,13 +31,14 @@ HASH = ("pbkdf2:sha256:600000$Nd1zVBBGvKfXTVBc$"
 
 with open(PERMS, "w") as f:
     f.write(
-        "_monitor_id_to_name:\n"
-        "  1: guinea-pig-cage-1\n"
-        "  2: guinea-pig-cage-2\n"
+        # A `_`-prefixed key, to prove metadata is never mistaken for a user.
+        "_notes:\n"
+        "  purpose: metadata, not an account\n"
         "admin:\n"
         f"  password_hash: \"{{HASH}}\"\n"
         "  cameras: [guinea-pig-cage-1, guinea-pig-cage-2]\n"
         "  audio: true\n"
+        "  recordings: true\n"
         "guest:\n"
         f"  password_hash: \"{{HASH}}\"\n"
         "  cameras: [guinea-pig-cage-1]\n"
@@ -51,7 +52,7 @@ PUB = "livecam.levantine.io"
 LAN = "livecam-lan.levantine.io"
 
 os.environ.update(
-    ZM_BACKEND_URL="http://zm.invalid",
+    FRIGATE_URL="http://frigate.invalid:5000",
     GO2RTC_URL="http://go2rtc.invalid:1984",
     PERMISSIONS_FILE=PERMS,
     EGRESS_DB=DB,
@@ -85,13 +86,13 @@ def check(name, condition, detail=""):
 def main():
     c = app.test_client()
 
-    # Nothing is reachable logged out -- including ZoneMinder, which is the
+    # Nothing is reachable logged out -- including Frigate, which is the
     # whole point of putting livecam's login in front of it.
     r = c.get("/", headers={"Host": PUB, "Accept": "text/html"})
     check("/ redirects to login when logged out",
           r.status_code == 302 and "/login" in r.headers["Location"], r.status_code)
-    r = c.get("/zm/index.php", headers={"Host": PUB, "Accept": "text/html"})
-    check("ZoneMinder is not reachable without a livecam session",
+    r = c.get("/frigate/", headers={"Host": PUB, "Accept": "text/html"})
+    check("Frigate is not reachable without a livecam session",
           r.status_code == 302 and "/login" in r.headers["Location"], r.status_code)
     # A <video> element must get a status, not a login page it would try to
     # decode as video.
@@ -166,7 +167,7 @@ def main():
     check("guest outside their time window gets nothing",
           allowed == set() and not audio, (allowed, audio))
     check("`_`-prefixed metadata is not treated as a user",
-          livecam.check_permission("_monitor_id_to_name", perms)[0] == set())
+          livecam.check_permission("_notes", perms)[0] == set())
     check("unknown user gets nothing",
           livecam.check_permission("nobody", perms)[0] == set())
 
@@ -201,12 +202,26 @@ def main():
                                headers={"Host": PUB})
     check("heartbeat rejected when logged out", r.status_code == 401, r.status_code)
 
-    # YAML gives integer keys while the query string gives strings; the
-    # mismatch made every recorded clip fall through to the raw id and be
-    # refused, which failing closed hid.
-    ids = {str(k): v for k, v in perms["_monitor_id_to_name"].items()}
-    check("numeric monitor ids map to camera names",
-          ids.get("1") == "guinea-pig-cage-1", ids)
+    # The recorded archive is a separate grant from live viewing. Frigate
+    # has no per-camera or per-audio gating matching this app's model, so a
+    # user allowed one camera, or no audio, must not inherit the archive --
+    # `guest` here is audio-free and has no `recordings` key at all.
+    r = c.get("/frigate/", headers={"Host": PUB})
+    check("a user granted recordings reaches Frigate",
+          r.status_code != 403, r.status_code)
+    denied = app.test_client()
+    denied.post("/login", data={"username": "guest", "password": PASSWORD},
+                headers={"Host": PUB})
+    r = denied.get("/frigate/", headers={"Host": PUB})
+    check("a user without the recordings grant is refused Frigate",
+          r.status_code == 403, r.status_code)
+    r = denied.get("/frigate/api/events", headers={"Host": PUB})
+    check("the refusal covers Frigate's API, not just its index",
+          r.status_code == 403, r.status_code)
+    check("the archive link is hidden from users without the grant",
+          "/frigate/" not in denied.get("/", headers={"Host": PUB}).get_data(as_text=True))
+    check("the archive link is shown to users with the grant",
+          "/frigate/" in page)
 
     livecam.record_egress(0, flush=True)
     before = livecam.egress_this_month()

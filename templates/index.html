@@ -64,7 +64,7 @@
   <h1>livecam</h1>
   <span class="who">{{ username }}</span>
   <span class="spacer"></span>
-  <a href="/zm/">recordings &amp; settings &rarr;</a>
+  {% if recordings_allowed %}<a href="/frigate/">recordings &amp; timeline &rarr;</a>{% endif %}
   <a href="{{ url_for('logout') }}">sign out</a>
 </header>
 
