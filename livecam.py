@@ -1019,6 +1019,23 @@ _PTZ_VELOCITY = {
     "zoom_out": {"Zoom": {"x": -0.5}},
 }
 
+# Single-click nudge (2026-08-27), distinct from the hold-to-move commands
+# above. A quick tap sent as ContinuousMove+Stop travels a distance that
+# depends on the round trip between those two separate commands, which is
+# exactly what makes a tap over the network hard to control precisely.
+# RelativeMove is one atomic ONVIF operation -- the camera executes the
+# whole displacement itself, so a step's size no longer depends on network
+# timing at all. One-fifth of _PTZ_VELOCITY's magnitude, not measured
+# against real hardware yet.
+_PTZ_STEP = {
+    "step_move_up": {"PanTilt": {"x": 0, "y": 0.1}},
+    "step_move_down": {"PanTilt": {"x": 0, "y": -0.1}},
+    "step_move_left": {"PanTilt": {"x": -0.1, "y": 0}},
+    "step_move_right": {"PanTilt": {"x": 0.1, "y": 0}},
+    "step_zoom_in": {"Zoom": {"x": 0.1}},
+    "step_zoom_out": {"Zoom": {"x": -0.1}},
+}
+
 
 def _ptz_loop_main():
     global _ptz_loop
@@ -1108,6 +1125,14 @@ async def _ptz_command(camera, command):
         if preset_token is None:
             raise LookupError(f"no such preset for {camera}: {command}")
         await ptz.GotoPreset({"ProfileToken": token, "PresetToken": preset_token})
+        return
+
+    step = _PTZ_STEP.get(command)
+    if step is not None:
+        move = ptz.create_type("RelativeMove")
+        move.ProfileToken = token
+        move.Translation = step
+        await ptz.RelativeMove(move)
         return
 
     velocity = _PTZ_VELOCITY.get(command)

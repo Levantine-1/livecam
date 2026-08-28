@@ -163,6 +163,12 @@ class _FakeMoveRequest:
         self.Velocity = None
 
 
+class _FakeRelativeMoveRequest:
+    def __init__(self):
+        self.ProfileToken = None
+        self.Translation = None
+
+
 class _FakePreset:
     def __init__(self, name, token):
         self.Name = name
@@ -174,12 +180,17 @@ class FakePTZService:
         self.calls = []  # (method, profile_token, payload) for assertions
 
     def create_type(self, name):
-        if name != "ContinuousMove":
-            raise NotImplementedError(name)
-        return _FakeMoveRequest()
+        if name == "ContinuousMove":
+            return _FakeMoveRequest()
+        if name == "RelativeMove":
+            return _FakeRelativeMoveRequest()
+        raise NotImplementedError(name)
 
     async def ContinuousMove(self, req):
         self.calls.append(("ContinuousMove", req.ProfileToken, req.Velocity))
+
+    async def RelativeMove(self, req):
+        self.calls.append(("RelativeMove", req.ProfileToken, req.Translation))
 
     async def Stop(self, req):
         self.calls.append(("Stop", req["ProfileToken"], req))
@@ -674,6 +685,15 @@ def main():
     check("Stop reached the fake camera",
           FakeONVIFCamera.instances[-1].ptz_service.calls[-1][0] == "Stop")
 
+    # Single-click "step" (2026-08-27): a RelativeMove, not a timed
+    # ContinuousMove+Stop -- travels the same fixed amount regardless of
+    # network round-trip time.
+    r = part.post("/ptz/the-boiz", json={"command": "step_move_up"}, headers={"Host": LAN})
+    check("PTZ step accepted", r.status_code == 200, r.status_code)
+    check("RelativeMove reached the fake camera with the right translation",
+          FakeONVIFCamera.instances[-1].ptz_service.calls[-1]
+          == ("RelativeMove", "profile-1", {"PanTilt": {"x": 0, "y": 0.1}}))
+
     r = part.post("/ptz/the-gurlz", json={"command": "move_up"}, headers={"Host": LAN})
     check("permission grant alone is not enough: the-gurlz has no config entry",
           r.status_code == 403, r.status_code)
@@ -686,6 +706,9 @@ def main():
           "PTZ_CAMERAS = new Set([])" in guest_html)
     r = other.post("/ptz/the-boiz", json={"command": "move_up"}, headers={"Host": LAN})
     check("config flag alone is not enough: guest has no ptz grant for the-boiz",
+          r.status_code == 403, r.status_code)
+    r = other.post("/ptz/the-boiz", json={"command": "step_move_up"}, headers={"Host": LAN})
+    check("the gate is command-agnostic: step commands are denied the same way",
           r.status_code == 403, r.status_code)
 
     r = app.test_client().post("/ptz/the-boiz", json={"command": "move_up"}, headers={"Host": LAN})

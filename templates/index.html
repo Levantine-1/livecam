@@ -562,14 +562,40 @@ function ptzStart(cam, command) {
   ptzWatchdog = setTimeout(ptzStopActive, 2000);
 }
 
+// A press below PTZ_HOLD_MS is a tap -- sent as a single fixed "step"
+// (server-side RelativeMove) instead of racing a ContinuousMove against its
+// own stop, which is what made quick taps overshoot unpredictably over the
+// network. At or above the threshold it's a hold, same continuous-move
+// behavior as before.
+const PTZ_HOLD_MS = 200;
+
 document.querySelectorAll('.ptzBtn').forEach(btn => {
   const cmd = btn.dataset.cmd;
-  const start = e => { e.preventDefault(); if (current) ptzStart(current, cmd); };
-  const stop = () => ptzStopActive();
-  btn.addEventListener('pointerdown', start);
-  btn.addEventListener('pointerup', stop);
-  btn.addEventListener('pointerleave', stop);
-  btn.addEventListener('pointercancel', stop);
+  let holdTimer = null;
+  let engaged = false;
+
+  const onDown = e => {
+    e.preventDefault();
+    if (!current) return;
+    engaged = false;
+    holdTimer = setTimeout(() => { engaged = true; ptzStart(current, cmd); }, PTZ_HOLD_MS);
+  };
+  const onUp = () => {
+    clearTimeout(holdTimer);
+    if (engaged) ptzStopActive();
+    else if (current) ptzSend(current, `step_${cmd}`);
+    engaged = false;
+  };
+  const onCancel = () => {
+    clearTimeout(holdTimer);
+    if (engaged) ptzStopActive(); // leaving mid-hold still needs a stop
+    engaged = false;              // leaving before the threshold is an abort, not a tap
+  };
+
+  btn.addEventListener('pointerdown', onDown);
+  btn.addEventListener('pointerup', onUp);
+  btn.addEventListener('pointerleave', onCancel);
+  btn.addEventListener('pointercancel', onCancel);
 });
 
 async function ptzLoadPresets(cam) {
