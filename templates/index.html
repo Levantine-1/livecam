@@ -48,6 +48,7 @@
   #overlay .bar .right { margin-left:auto; display:flex; align-items:center; gap:.5rem; }
   #overlay video { flex:1; min-height:0; width:100%; background:#000; object-fit:contain; }
   #soundBtn.on { background:#2f6fd0; }
+  .qualityBtn.on { background:#2e9e44; }
   #gainWrap[hidden] { display:none; }
   #gainWrap { display:flex; align-items:center; gap:.4rem; font-size:.75rem; color:#9aa3b2; }
   #gain { width:90px; }
@@ -149,8 +150,13 @@
     <div class="right">
       <!-- Unlike sound/PTZ, quality isn't permission-gated per camera or
            user -- every camera has both a main and secondary stream, so
-           this is always visible rather than shown/hidden per camera. -->
-      <button id="qualityBtn" type="button" aria-pressed="false">Main stream</button>
+           these are always visible rather than shown/hidden per camera. -->
+      <button id="qualityMainBtn" class="qualityBtn" type="button" aria-pressed="true">Primary</button>
+      <button id="qualitySecondaryBtn" class="qualityBtn" type="button" aria-pressed="false">Secondary</button>
+      <!-- Shown/hidden per camera exactly like ptzPad itself -- nothing to
+           toggle on a camera with no PTZ. Resets to visible ("Hide PTZ") on
+           every camera open, matching ptzPad's own default-visible state. -->
+      <button id="ptzToggleBtn" type="button" aria-pressed="true" hidden>Hide PTZ</button>
       <!-- Both are rendered because audio is granted per camera: which one
            applies depends on which camera is expanded, not on the account.
            Sound is off until asked for, and asking is a click -- that click
@@ -215,7 +221,9 @@ const overlayVideo = document.getElementById('overlayVideo');
 const overlayName = document.getElementById('overlayName');
 const dlg = document.getElementById('idle');
 const tapToPlay = document.getElementById('tapToPlay');
-const qualityBtn = document.getElementById('qualityBtn');
+const qualityMainBtn = document.getElementById('qualityMainBtn');
+const qualitySecondaryBtn = document.getElementById('qualitySecondaryBtn');
+const ptzToggleBtn = document.getElementById('ptzToggleBtn');
 const soundBtn = document.getElementById('soundBtn');
 const noAudioBadge = document.getElementById('noAudioBadge');
 const gainWrapEl = document.getElementById('gainWrap');
@@ -433,10 +441,14 @@ let currentQuality = 'full';
 
 function loadOverlay(cam, quality, audio) {
   currentQuality = quality;
-  if (qualityBtn) {
-    const onMain = quality === 'full';
-    qualityBtn.setAttribute('aria-pressed', String(!onMain));
-    qualityBtn.textContent = onMain ? 'Main stream' : 'Secondary stream';
+  const onMain = quality === 'full';
+  if (qualityMainBtn) {
+    qualityMainBtn.classList.toggle('on', onMain);
+    qualityMainBtn.setAttribute('aria-pressed', String(onMain));
+  }
+  if (qualitySecondaryBtn) {
+    qualitySecondaryBtn.classList.toggle('on', !onMain);
+    qualitySecondaryBtn.setAttribute('aria-pressed', String(!onMain));
   }
   startStream(overlayVideo, cam, quality, audio,
               () => say('Tap the video to start playback.'));
@@ -464,6 +476,11 @@ function expand(cam) {
   overlayVideo.muted = true;
   const canPtz = PTZ_CAMERAS.has(cam);
   ptzPad.hidden = !canPtz;
+  if (ptzToggleBtn) {
+    ptzToggleBtn.hidden = !canPtz;
+    ptzToggleBtn.setAttribute('aria-pressed', 'true');
+    ptzToggleBtn.textContent = 'Hide PTZ';
+  }
   if (canPtz) ptzLoadPresets(cam); else { ptzPresetsEl.hidden = true; ptzPresetsEl.innerHTML = ''; }
   overlay.hidden = false;
   say('');
@@ -530,9 +547,25 @@ function collapse() {
 // watchForStall(): on a link too noisy to hold full quality reliably (wifi
 // interference, for instance), waiting out an 8-second stall every time is
 // worse than just picking the secondary stream up front.
-if (qualityBtn) {
-  qualityBtn.addEventListener('click', () => {
-    if (current) loadOverlay(current, currentQuality === 'full' ? 'sub' : 'full', soundOn);
+if (qualityMainBtn) {
+  qualityMainBtn.addEventListener('click', () => {
+    if (current && currentQuality !== 'full') loadOverlay(current, 'full', soundOn);
+  });
+}
+if (qualitySecondaryBtn) {
+  qualitySecondaryBtn.addEventListener('click', () => {
+    if (current && currentQuality !== 'sub') loadOverlay(current, 'sub', soundOn);
+  });
+}
+// Visibility only -- PTZ_CAMERAS/_authorise_ptz already gate whether PTZ
+// commands are accepted at all; this just declutters the video when the
+// pad isn't needed, same as it already resets to shown on every camera open.
+if (ptzToggleBtn) {
+  ptzToggleBtn.addEventListener('click', () => {
+    const nowHidden = !ptzPad.hidden;
+    ptzPad.hidden = nowHidden;
+    ptzToggleBtn.setAttribute('aria-pressed', String(!nowHidden));
+    ptzToggleBtn.textContent = nowHidden ? 'Show PTZ' : 'Hide PTZ';
   });
 }
 
@@ -603,6 +636,14 @@ let ptzActiveCamera = null;
 let ptzWatchdog = null;
 
 async function ptzSend(cam, command) {
+  // pointerdown/pointerup/pointerleave/pointercancel aren't in the global
+  // activity list below (mousemove/keydown/click/touchstart/scroll), so a
+  // session spent only nudging the d-pad was going idle mid-use: sendBeat()
+  // would call pauseAll(), which pops a modal <dialog> that silently
+  // swallows every further click underneath it, including PTZ ones. Every
+  // PTZ command funnels through here, so this is the one place that needs
+  // to count as activity.
+  lastActive = Date.now();
   try {
     await fetch(`/ptz/${encodeURIComponent(cam)}`, {
       method: 'POST',
@@ -642,6 +683,10 @@ document.querySelectorAll('.ptzBtn').forEach(btn => {
   const onDown = e => {
     e.preventDefault();
     if (!current) return;
+    // Defensive: a previous press whose pointerup/pointerleave never fired
+    // (an interrupted touch gesture) would otherwise leave its timer
+    // pending, and it would go on to fire on its own later.
+    clearTimeout(holdTimer);
     engaged = false;
     holdTimer = setTimeout(() => { engaged = true; ptzStart(current, cmd); }, PTZ_HOLD_MS);
   };
