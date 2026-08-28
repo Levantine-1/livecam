@@ -47,8 +47,8 @@
   #overlay .bar button:hover { background:#3d4757; }
   #overlay .bar .right { margin-left:auto; display:flex; align-items:center; gap:.5rem; }
   #overlay video { flex:1; min-height:0; width:100%; background:#000; object-fit:contain; }
-  #soundBtn.on { background:#2f6fd0; }
-  .qualityBtn.on { background:#2e9e44; }
+  #overlay .bar #soundBtn.on { background:#2f6fd0; }
+  #overlay .bar .qualityBtn.on { background:#2e9e44; }
   #gainWrap[hidden] { display:none; }
   #gainWrap { display:flex; align-items:center; gap:.4rem; font-size:.75rem; color:#9aa3b2; }
   #gain { width:90px; }
@@ -147,6 +147,8 @@
   <div class="bar">
     <strong id="overlayName"></strong>
     <span class="badge" id="overlayRes">&mdash;</span>
+    <span class="badge" id="overlayRate">&mdash;</span>
+    <span class="badge" id="overlayTotal">&mdash;</span>
     <div class="right">
       <!-- Unlike sound/PTZ, quality isn't permission-gated per camera or
            user -- every camera has both a main and secondary stream, so
@@ -219,6 +221,8 @@ const tiles = Array.from(document.querySelectorAll('#grid video'));
 const overlay = document.getElementById('overlay');
 const overlayVideo = document.getElementById('overlayVideo');
 const overlayName = document.getElementById('overlayName');
+const overlayRateEl = document.getElementById('overlayRate');
+const overlayTotalEl = document.getElementById('overlayTotal');
 const dlg = document.getElementById('idle');
 const tapToPlay = document.getElementById('tapToPlay');
 const qualityMainBtn = document.getElementById('qualityMainBtn');
@@ -283,8 +287,9 @@ let transport = prefersHls() ? 'hls' : 'mp4';
 // natively-played HLS.
 const usingHls = () => transport === 'hls';
 
-function urlFor(cam, q, audio, t) {
-  const qs = `token=${encodeURIComponent(TOKEN)}&quality=${q}` + (audio ? '&audio=1' : '');
+function urlFor(cam, q, audio, t, conn) {
+  const qs = `token=${encodeURIComponent(TOKEN)}&quality=${q}` + (audio ? '&audio=1' : '')
+    + (conn ? `&conn=${encodeURIComponent(conn)}` : '');
   const cameraPath = encodeURIComponent(cam);
   return t === 'hls'
     ? `/live/${cameraPath}/master.m3u8?${qs}`
@@ -299,15 +304,25 @@ function urlFor(cam, q, audio, t) {
 // never arrive.
 const TRANSPORT_TIMEOUT_MS = 6000;
 
-function startStream(v, cam, quality, audio, onBlocked) {
+function startStream(v, cam, quality, audio, onBlocked, onStatus, conn) {
   const tried = new Set();
+  // Only the overlay passes onStatus -- tiles have nowhere to show it (and
+  // no need to: this exists so a full-screen blank video says *something*
+  // rather than looking identically stuck whether it's about to connect or
+  // never will). What it reports is deliberately limited to what's actually
+  // observable from a plain <video src> -- which transport, how long it's
+  // been waiting -- not a guess at which hop (server/camera/network) is the
+  // holdup, since this has no way to know that.
+  const emit = onStatus || (() => {});
 
   function attempt(t) {
     tried.add(t);
-    let settled = false, timer = null;
+    let settled = false, timer = null, statusTick = null;
+    const startedAt = Date.now();
 
     const cleanup = () => {
       clearTimeout(timer);
+      clearInterval(statusTick);
       v.removeEventListener('playing', succeed);
       v.removeEventListener('error', fail);
     };
@@ -315,6 +330,7 @@ function startStream(v, cam, quality, audio, onBlocked) {
       if (settled) return;
       settled = true;
       cleanup();
+      emit('');
       // Remember what actually worked, so other tiles and the expanded view
       // go straight there instead of each paying the timeout.
       transport = t;
@@ -331,6 +347,12 @@ function startStream(v, cam, quality, audio, onBlocked) {
       }
     };
 
+    emit(t === 'hls' ? 'Connecting (fallback stream)…' : 'Connecting…');
+    statusTick = setInterval(() => {
+      const waited = Math.round((Date.now() - startedAt) / 1000);
+      emit(`${t === 'hls' ? 'Still connecting (fallback stream)' : 'Still connecting'}… (${waited}s)`);
+    }, 1000);
+
     v.addEventListener('playing', succeed);
     v.addEventListener('error', fail);
     timer = setTimeout(() => { if (v.currentTime > 0) succeed(); else fail(); },
@@ -342,7 +364,7 @@ function startStream(v, cam, quality, audio, onBlocked) {
     // behind the overlay, paying for the expanded camera twice over.
     v._abandonStream = () => { settled = true; cleanup(); };
 
-    v.src = urlFor(cam, quality, audio, t);
+    v.src = urlFor(cam, quality, audio, t, conn);
     const p = v.play();
     // A rejected play() is an autoplay refusal, not a broken transport --
     // the tap-to-play path handles that, so do not burn the fallback on it.
@@ -439,6 +461,50 @@ let current = null;          // camera name
 let soundOn = false;         // has the viewer asked for audio this session
 let currentQuality = 'full';
 
+// --- live data rate / session total ---------------------------------------
+// No per-stream byte counter exists server-side otherwise -- conn is a
+// fresh id generated below on every loadOverlay() call, so a new camera, a
+// manual quality switch, or an automatic reconnect all naturally reset the
+// "this session" total, the same way the quality buttons already reset.
+const USAGE_POLL_MS = 1500;
+let usagePollTimer = null;
+
+function formatRate(bytesPerSec) {
+  const bits = bytesPerSec * 8;
+  if (bits >= 1e6) return `${(bits / 1e6).toFixed(1)} Mbps`;
+  if (bits >= 1e3) return `${(bits / 1e3).toFixed(0)} Kbps`;
+  return `${Math.round(bits)} bps`;
+}
+
+function formatBytes(bytes) {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(0)} KB`;
+  return `${bytes} B`;
+}
+
+function watchUsage(connId) {
+  clearInterval(usagePollTimer);
+  if (overlayRateEl) overlayRateEl.textContent = '—';
+  if (overlayTotalEl) overlayTotalEl.textContent = '—';
+  let lastBytes = 0, lastAt = Date.now();
+  usagePollTimer = setInterval(async () => {
+    if (overlay.hidden) return;
+    try {
+      const r = await fetch(`/api/stream-usage?conn=${encodeURIComponent(connId)}`);
+      if (!r.ok) return;
+      const { bytes } = await r.json();
+      const now = Date.now();
+      const elapsed = (now - lastAt) / 1000;
+      if (elapsed > 0 && overlayRateEl) {
+        overlayRateEl.textContent = formatRate(Math.max(bytes - lastBytes, 0) / elapsed);
+      }
+      if (overlayTotalEl) overlayTotalEl.textContent = formatBytes(bytes);
+      lastBytes = bytes; lastAt = now;
+    } catch (e) { /* transient; next poll retries */ }
+  }, USAGE_POLL_MS);
+}
+
 function loadOverlay(cam, quality, audio) {
   currentQuality = quality;
   const onMain = quality === 'full';
@@ -450,8 +516,10 @@ function loadOverlay(cam, quality, audio) {
     qualitySecondaryBtn.classList.toggle('on', !onMain);
     qualitySecondaryBtn.setAttribute('aria-pressed', String(!onMain));
   }
+  const connId = crypto.randomUUID();
+  watchUsage(connId);
   startStream(overlayVideo, cam, quality, audio,
-              () => say('Tap the video to start playback.'));
+              () => say('Tap the video to start playback.'), say, connId);
   watchForStall();
 }
 
@@ -513,6 +581,7 @@ function watchForStall() {
   stallTimer = setInterval(() => {
     if (overlay.hidden || overlayVideo.paused) return;
     const t = overlayVideo.currentTime;
+    const wasStuck = stuck > 0;
     stuck = (t === last) ? stuck + 1 : 0;
     last = t;
     if (stuck >= STALL_DOWNGRADE_S && currentQuality === 'full') {
@@ -523,6 +592,13 @@ function watchForStall() {
       clearInterval(stallTimer);
       say('Camera feed dropped -- reconnecting…');
       loadOverlay(current, currentQuality, soundOn);
+    } else if (stuck > 0) {
+      // Live from the first missed second, not just at the thresholds above
+      // -- so a stall reads as "still stuck" the whole time it lasts,
+      // rather than silence until one of those two actions fires.
+      say(`No new video for ${stuck}s…`);
+    } else if (wasStuck) {
+      say('');
     }
   }, 1000);
 }
@@ -530,6 +606,9 @@ function watchForStall() {
 function collapse() {
   if (overlay.hidden) return;
   clearInterval(stallTimer); stallTimer = null;
+  clearInterval(usagePollTimer); usagePollTimer = null;
+  if (overlayRateEl) overlayRateEl.textContent = '—';
+  if (overlayTotalEl) overlayTotalEl.textContent = '—';
   stopVideo(overlayVideo);
   // Safety net: closing the view while a direction is still held (Esc mid-
   // press, a tab switch that eats the pointerup) must not leave a real

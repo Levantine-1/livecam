@@ -189,6 +189,46 @@ _egress_lock = threading.Lock()
 _egress_pending = 0
 _egress_last_flush = 0.0
 
+# Live per-connection byte counter for the overlay's rate/total display --
+# unlike record_egress() above (a global monthly aggregate with no
+# per-stream dimension), this is keyed per browser-generated connection id
+# so exactly one stream's own bytes are reported back to it. Swept lazily
+# on read rather than via a background thread, the same shape
+# _prune_hls_sessions() below already uses for _hls_sessions.
+STREAM_USAGE_TTL_SECONDS = int(os.environ.get("STREAM_USAGE_TTL_SECONDS", "300"))
+_stream_bytes_lock = threading.Lock()
+_stream_bytes = {}  # conn_id -> {"bytes": int, "seen": epoch}
+_CONN_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+def _sanitize_conn_id(value):
+    """A validated conn id, or None. It rides through a rewritten HLS
+    playlist body as plain text (see live_hls()/hls_proxy()), so an
+    unvalidated client-supplied value could otherwise inject extra lines or
+    break the m3u8 format -- the client only ever sends crypto.randomUUID(),
+    so this is deliberately narrow rather than permissive."""
+    if value and _CONN_ID_RE.match(value):
+        return value
+    return None
+
+
+def _record_stream_bytes(conn_id, count):
+    if not conn_id:
+        return
+    with _stream_bytes_lock:
+        entry = _stream_bytes.setdefault(conn_id, {"bytes": 0, "seen": 0.0})
+        entry["bytes"] += count
+        entry["seen"] = time.time()
+
+
+def _stream_bytes_for(conn_id):
+    cutoff = time.time() - STREAM_USAGE_TTL_SECONDS
+    with _stream_bytes_lock:
+        for cid in [c for c, v in _stream_bytes.items() if v["seen"] < cutoff]:
+            del _stream_bytes[cid]
+        entry = _stream_bytes.get(conn_id)
+        return entry["bytes"] if entry else 0
+
 
 def _egress_conn():
     directory = os.path.dirname(EGRESS_DB)
@@ -675,6 +715,17 @@ def usage():
     )
 
 
+@app.route("/api/stream-usage")
+@login_required
+def stream_usage():
+    """Bytes sent so far for one overlay connection, for its live rate/total
+    display. An unrecognised or missing id -- already ended, never existed,
+    or invalid -- is reported as zero rather than a 404: the poller can't
+    tell those apart from "hasn't sent anything yet" and shouldn't need to."""
+    conn_id = _sanitize_conn_id(request.args.get("conn"))
+    return jsonify({"bytes": _stream_bytes_for(conn_id) if conn_id else 0})
+
+
 # --------------------------------------------------------------------------
 # HLS, for Safari and every browser on iOS
 #
@@ -813,6 +864,11 @@ def live_hls(camera):
 
     # The master points at `hls/playlist.m3u8?id=SESSION`; rewrite that one
     # line to our own route so the browser never talks to go2rtc directly.
+    # conn (the overlay's own rate/total connection id, absent for tiles)
+    # rides along here too -- hls_proxy() picks it up from this same line
+    # and re-attaches it to every segment reference it hands back in turn,
+    # so it keeps propagating without go2rtc ever knowing about it.
+    conn_id = _sanitize_conn_id(request.args.get("conn"))
     metered = is_public_request()
     session_ids = []
     lines = []
@@ -820,7 +876,10 @@ def live_hls(camera):
         match = re.match(r"^hls/playlist\.m3u8\?id=(\w+)$", line.strip())
         if match:
             session_ids.append(match.group(1))
-            lines.append(f"/hls/playlist.m3u8?id={match.group(1)}")
+            playlist_url = f"/hls/playlist.m3u8?id={match.group(1)}"
+            if conn_id:
+                playlist_url += f"&conn={conn_id}"
+            lines.append(playlist_url)
         else:
             lines.append(line)
 
@@ -855,14 +914,17 @@ def live_hls(camera):
 def hls_proxy(sub):
     """Media playlists and segments, authorised by the go2rtc session id.
 
-    Segment references inside a media playlist are relative, so they resolve
-    back here without any rewriting -- the only thing this has to do is
-    check that the id belongs to the caller before passing bytes along.
+    Segment references inside a media playlist are relative, so the `id`
+    they're authorised by resolves back here without needing to be
+    rewritten -- the only rewriting this does is appending `conn` (the
+    overlay's own rate/total id, when present) to each one, since go2rtc
+    has no idea that parameter exists.
     """
     if ".." in sub or sub.startswith("/"):
         abort(400)
 
     camera, metered = _authorise_hls(request.args.get("id"))
+    conn_id = _sanitize_conn_id(request.args.get("conn"))
 
     upstream = requests.get(
         f"{GO2RTC_URL}/api/hls/{sub}",
@@ -871,8 +933,22 @@ def hls_proxy(sub):
         timeout=15,
     )
     body = upstream.content
+
+    # Media playlists reference their own segments with the same ?id=...
+    # this request carried (see live_hls()'s comment) -- conn needs the same
+    # treatment so it keeps propagating to every segment fetch the browser
+    # makes on its own, not just this one response.
+    if conn_id and sub.endswith(".m3u8"):
+        text = body.decode("utf-8", errors="replace")
+        lines = [
+            f"{line}&conn={conn_id}" if line.strip() and not line.startswith("#") else line
+            for line in text.splitlines()
+        ]
+        body = ("\n".join(lines) + "\n").encode("utf-8")
+
     if metered:
         record_egress(len(body), flush=sub.endswith(".m3u8"))
+    _record_stream_bytes(conn_id, len(body))
 
     content_type = upstream.headers.get(
         "Content-Type",
@@ -924,6 +1000,9 @@ def live(camera):
 
     want_audio = request.args.get("audio") == "1"
     stream = resolve_stream_name(camera, camera in audio_cameras, quality, want_audio)
+    # Set by the overlay for its own rate/total display -- absent for tiles,
+    # which don't track this. See _record_stream_bytes()'s own comment.
+    conn_id = _sanitize_conn_id(request.args.get("conn"))
 
     upstream = requests.get(
         f"{GO2RTC_URL}/api/stream.mp4",
@@ -957,6 +1036,7 @@ def live(camera):
                 sent += len(chunk)
                 if metered:
                     record_egress(len(chunk))
+                _record_stream_bytes(conn_id, len(chunk))
                 yield chunk
         finally:
             upstream.close()

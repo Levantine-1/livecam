@@ -129,6 +129,10 @@ class FakeUpstreamResponse:
         self.content_accessed = True
         return b"".join(self._chunks)
 
+    @property
+    def text(self):
+        return b"".join(self._chunks).decode("utf-8")
+
     def iter_content(self, chunk_size=None):
         self.iter_content_calls += 1
         yield from self._chunks
@@ -494,6 +498,48 @@ def main():
     check("/api/usage reports the counter",
           r.status_code == 200 and r.json["bytes"] == after,
           r.json if r.status_code == 200 else r.status_code)
+
+    # --- live per-connection byte counter (2026-08) ---
+    # _record_stream_bytes()/_stream_bytes_for() are exercised directly here,
+    # the same way record_egress()/egress_this_month() are above -- the
+    # actual byte-plumbing through pump()/hls_proxy() is a couple of extra
+    # lines around counters already proven correct elsewhere in this file.
+    livecam._record_stream_bytes("testconn1", 1000)
+    livecam._record_stream_bytes("testconn1", 500)
+    r = c.get("/api/stream-usage?conn=testconn1", headers={"Host": PUB})
+    check("/api/stream-usage reports a connection's accumulated bytes",
+          r.status_code == 200 and r.json["bytes"] == 1500, r.json)
+
+    r = c.get("/api/stream-usage?conn=never-seen-this-one", headers={"Host": PUB})
+    check("an unrecognised conn id is zero, not an error",
+          r.status_code == 200 and r.json["bytes"] == 0, r.json)
+
+    r = c.get("/api/stream-usage", headers={"Host": PUB})
+    check("a missing conn id is zero, not an error",
+          r.status_code == 200 and r.json["bytes"] == 0, r.json)
+
+    check("conn ids with characters outside the safe set are rejected, not stored verbatim",
+          livecam._sanitize_conn_id("../../etc/passwd") is None
+          and livecam._sanitize_conn_id("has spaces") is None
+          and livecam._sanitize_conn_id("a-real-uuid-1234") == "a-real-uuid-1234")
+
+    # The master playlist rewrite has to carry `conn` through to the one
+    # line it already rewrites (see live_hls()'s own comment on why:
+    # go2rtc has no idea this parameter exists), so hls_proxy() can pick it
+    # back up on the segment/media-playlist fetches that follow.
+    real_requests_get = livecam.requests.get
+    try:
+        fake_master = FakeUpstreamResponse(
+            200, livecam.M3U8_CONTENT_TYPE, [b"#EXTM3U\nhls/playlist.m3u8?id=abc123\n"])
+        livecam.requests.get = lambda *a, **kw: fake_master
+        r = c.get(f"/live/the-boiz/master.m3u8?token={token}&conn=rateconn1",
+                  headers={"Host": PUB})
+        body = r.get_data(as_text=True)
+        check("HLS master rewrite carries conn through to the rewritten playlist line",
+              r.status_code == 200 and "/hls/playlist.m3u8?id=abc123&conn=rateconn1" in body,
+              body)
+    finally:
+        livecam.requests.get = real_requests_get
 
     c.get("/logout", headers={"Host": PUB})
     r = c.get("/", headers={"Host": PUB, "Accept": "text/html"})
