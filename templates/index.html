@@ -147,6 +147,10 @@
     <strong id="overlayName"></strong>
     <span class="badge" id="overlayRes">&mdash;</span>
     <div class="right">
+      <!-- Unlike sound/PTZ, quality isn't permission-gated per camera or
+           user -- every camera has both a main and secondary stream, so
+           this is always visible rather than shown/hidden per camera. -->
+      <button id="qualityBtn" type="button" aria-pressed="false">Main stream</button>
       <!-- Both are rendered because audio is granted per camera: which one
            applies depends on which camera is expanded, not on the account.
            Sound is off until asked for, and asking is a click -- that click
@@ -211,6 +215,7 @@ const overlayVideo = document.getElementById('overlayVideo');
 const overlayName = document.getElementById('overlayName');
 const dlg = document.getElementById('idle');
 const tapToPlay = document.getElementById('tapToPlay');
+const qualityBtn = document.getElementById('qualityBtn');
 const soundBtn = document.getElementById('soundBtn');
 const noAudioBadge = document.getElementById('noAudioBadge');
 const gainWrapEl = document.getElementById('gainWrap');
@@ -428,6 +433,11 @@ let currentQuality = 'full';
 
 function loadOverlay(cam, quality, audio) {
   currentQuality = quality;
+  if (qualityBtn) {
+    const onMain = quality === 'full';
+    qualityBtn.setAttribute('aria-pressed', String(!onMain));
+    qualityBtn.textContent = onMain ? 'Main stream' : 'Secondary stream';
+  }
   startStream(overlayVideo, cam, quality, audio,
               () => say('Tap the video to start playback.'));
   watchForStall();
@@ -513,6 +523,17 @@ function collapse() {
   say('');
   current = null;
   startTiles();
+}
+
+// --- quality ---------------------------------------------------------------
+// A manual override alongside the automatic downgrade-on-stall in
+// watchForStall(): on a link too noisy to hold full quality reliably (wifi
+// interference, for instance), waiting out an 8-second stall every time is
+// worse than just picking the secondary stream up front.
+if (qualityBtn) {
+  qualityBtn.addEventListener('click', () => {
+    if (current) loadOverlay(current, currentQuality === 'full' ? 'sub' : 'full', soundOn);
+  });
 }
 
 // --- sound ---------------------------------------------------------------
