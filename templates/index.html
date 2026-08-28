@@ -377,6 +377,36 @@ function startTiles() {
   tiles.forEach(v => startStream(v, v.dataset.camera, 'sub', false, showTapToPlay));
 }
 
+// Tiles have no post-'playing' watcher otherwise -- startStream()'s own
+// 'error'/'playing' listeners are torn down once a tile starts, so a camera
+// that goes fully offline mid-view would stay frozen forever without this.
+// Same currentTime-polling approach as the overlay's watchForStall(), just
+// tracked per tile since several can be live at once. The min-gap throttle
+// keeps a still-offline camera from being retried every single tick.
+const TILE_STALL_TICK_MS = 2000;
+const TILE_STALL_TICKS = 3;               // ~6s with no progress
+const TILE_RECONNECT_MIN_GAP_MS = 15000;  // don't retry one tile more than once per ~15s
+
+const tileStallState = new Map(); // video element -> {last, stuck, lastAttempt}
+
+function watchTilesForStall() {
+  setInterval(() => {
+    tiles.forEach(v => {
+      if (v.paused) { tileStallState.delete(v); return; } // stopped (overlay open) or never started
+      const state = tileStallState.get(v) || { last: -1, stuck: 0, lastAttempt: 0 };
+      const t = v.currentTime;
+      state.stuck = (t === state.last) ? state.stuck + 1 : 0;
+      state.last = t;
+      if (state.stuck >= TILE_STALL_TICKS && Date.now() - state.lastAttempt >= TILE_RECONNECT_MIN_GAP_MS) {
+        state.stuck = 0;
+        state.lastAttempt = Date.now();
+        startStream(v, v.dataset.camera, 'sub', false, showTapToPlay);
+      }
+      tileStallState.set(v, state);
+    });
+  }, TILE_STALL_TICK_MS);
+}
+
 // If the browser refuses, say so and offer the one thing that fixes it: a
 // tap. One gesture releases every tile at once, so this costs a single tap
 // rather than one per camera.
@@ -439,6 +469,16 @@ function expand(cam) {
 // playing, the stream is arriving but not rendering -- a slow client on a
 // 2960x1668 feed, or a link that cannot keep up. Drop to the substream and
 // say so, rather than leaving a frozen frame on screen with no explanation.
+//
+// A longer stall than that is a different problem: the camera itself is
+// gone (network drop, power cycle), not a bandwidth issue -- in that case
+// dropping quality would never help, so reconnect the same stream instead.
+// loadOverlay() calls back into this function, so a reconnect re-arms a
+// fresh watcher automatically and keeps retrying every STALL_RECONNECT_S
+// for as long as the overlay stays open and the camera stays unreachable.
+const STALL_DOWNGRADE_S = 8;
+const STALL_RECONNECT_S = 20;
+
 let stallTimer = null;
 function watchForStall() {
   clearInterval(stallTimer);
@@ -448,10 +488,14 @@ function watchForStall() {
     const t = overlayVideo.currentTime;
     stuck = (t === last) ? stuck + 1 : 0;
     last = t;
-    if (stuck >= 8 && currentQuality === 'full') {
+    if (stuck >= STALL_DOWNGRADE_S && currentQuality === 'full') {
       clearInterval(stallTimer);
       say('Full quality was not keeping up here, so this dropped to the lower-resolution stream.');
       loadOverlay(current, 'sub', false);
+    } else if (stuck >= STALL_RECONNECT_S) {
+      clearInterval(stallTimer);
+      say('Camera feed dropped -- reconnecting…');
+      loadOverlay(current, currentQuality, soundOn);
     }
   }, 1000);
 }
@@ -725,6 +769,7 @@ addEventListener('visibilitychange', () => {
 });
 
 startTiles();
+watchTilesForStall();
 sendBeat();
 beat = setInterval(() => { sendBeat(); refreshUsage(); }, BEAT_MS);
 </script>
