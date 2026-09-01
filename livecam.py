@@ -1437,6 +1437,30 @@ def _store_clip(file_storage, label=None):
     return name
 
 
+def backchannel_stream(camera, streams):
+    """Which go2rtc stream currently carries this camera's speaker, or None.
+
+    NOT necessarily the stream named after the camera. These cameras expose
+    exactly one ONVIF talk channel, and it is claimed by whichever of go2rtc's
+    RTSP connections to that camera -- main, substream, any other variant --
+    happens to establish first. Observed live: it sat on `baby-ptz` after one
+    Frigate restart and on `baby-ptz_sub` after the next, with nothing else
+    changed. Hardcoding the main stream worked once by luck and then failed
+    with "can't find consumer" once the race went the other way.
+
+    So the holder is discovered per play. The tell is a producer media
+    marked sendonly with the PCMA (G.711 A-law) codec the backchannel uses.
+    """
+    for name, info in (streams or {}).items():
+        if name != camera and not name.startswith(f"{camera}_"):
+            continue
+        for producer in (info or {}).get("producers") or []:
+            for media in producer.get("medias") or []:
+                if "sendonly" in media and "PCMA" in media:
+                    return name
+    return None
+
+
 def _play_clip(camera, clip_id):
     """Ask go2rtc to push a stored clip down the camera's audio backchannel.
 
@@ -1448,28 +1472,55 @@ def _play_clip(camera, clip_id):
     if not TALK_CLIP_BASE_URL:
         raise RuntimeError("TALK_CLIP_BASE_URL is not configured")
 
+    # The gap check reserves the camera, but the reservation is rolled back
+    # below if the play fails. Recording it unconditionally meant one failed
+    # attempt locked out the retry with a misleading "already playing".
     now = time.time()
     with _talk_lock:
         last = _talk_last_played.get(camera, 0)
         if now - last < TALK_MIN_GAP_SECONDS:
             raise RuntimeError("a clip is already playing on this camera")
+        previous = _talk_last_played.get(camera)
         _talk_last_played[camera] = now
 
-    token = _soundboard_serializer().dumps(clip_id)
-    clip_url = f"{TALK_CLIP_BASE_URL}/soundboard/raw/{token}"
-    # #audio=pcma makes go2rtc transcode to G.711 A-law, which is what the
-    # backchannel advertises; without it the push is refused as a codec
-    # mismatch.
-    resp = requests.post(
-        f"{GO2RTC_URL}/api/streams",
-        params={"dst": camera, "src": f"ffmpeg:{clip_url}#audio=pcma"},
-        timeout=15,
-    )
-    if resp.status_code != 200:
-        log.warning("clip play rejected camera=%s clip=%s status=%s body=%s",
-                    camera, clip_id, resp.status_code, resp.text[:200])
-        raise RuntimeError(f"go2rtc refused the clip ({resp.status_code})")
-    log.info("played clip camera=%s clip=%s user=%s", camera, clip_id, current_user())
+    def _release():
+        with _talk_lock:
+            if _talk_last_played.get(camera) == now:
+                if previous is None:
+                    _talk_last_played.pop(camera, None)
+                else:
+                    _talk_last_played[camera] = previous
+
+    try:
+        listing = requests.get(f"{GO2RTC_URL}/api/streams", timeout=10)
+        listing.raise_for_status()
+        target = backchannel_stream(camera, listing.json())
+        if target is None:
+            log.warning("no backchannel stream for camera=%s; go2rtc holds no "
+                        "sendonly PCMA track", camera)
+            raise RuntimeError(
+                "the camera's speaker channel isn't open right now -- "
+                "another connection may be holding it")
+
+        token = _soundboard_serializer().dumps(clip_id)
+        clip_url = f"{TALK_CLIP_BASE_URL}/soundboard/raw/{token}"
+        # #audio=pcma makes go2rtc transcode to G.711 A-law, which is what the
+        # backchannel advertises; without it the push is refused as a codec
+        # mismatch.
+        resp = requests.post(
+            f"{GO2RTC_URL}/api/streams",
+            params={"dst": target, "src": f"ffmpeg:{clip_url}#audio=pcma"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log.warning("clip play rejected camera=%s stream=%s clip=%s status=%s body=%s",
+                        camera, target, clip_id, resp.status_code, resp.text[:200])
+            raise RuntimeError(f"go2rtc refused the clip ({resp.status_code})")
+    except Exception:
+        _release()
+        raise
+    log.info("played clip camera=%s stream=%s clip=%s user=%s",
+             camera, target, clip_id, current_user())
 
 
 @app.route("/ptz/<camera>", methods=["POST"])

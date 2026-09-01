@@ -913,6 +913,39 @@ def main():
         r = part.post("/talk/the-boiz/volume", json={"volume": bad}, headers={"Host": LAN})
         check(f"volume {bad!r} is refused", r.status_code == 400, r.status_code)
 
+    # Which go2rtc stream carries the speaker is NOT fixed: the camera has one
+    # talk channel, claimed by whichever of go2rtc's connections to it
+    # connects first. Both of these payloads are real shapes observed live --
+    # the backchannel sat on the main stream after one Frigate restart and on
+    # the substream after the next. Assuming the main stream shipped a bug
+    # that failed with "can't find consumer".
+    on_main = {
+        "baby-ptz": {"producers": [{"medias": [
+            "video, recvonly, H264", "audio, recvonly, MPEG4-GENERIC/16000",
+            "audio, sendonly, PCMA/8000"]}]},
+        "baby-ptz_sub": {"producers": [{"medias": [
+            "video, recvonly, H264", "audio, recvonly, MPEG4-GENERIC/16000"]}]},
+    }
+    on_sub = {
+        "baby-ptz": {"producers": [{"medias": [
+            "video, recvonly, H264", "audio, recvonly, MPEG4-GENERIC/16000"]}]},
+        "baby-ptz_sub": {"producers": [{"medias": [
+            "video, recvonly, H264", "audio, recvonly, MPEG4-GENERIC/16000",
+            "audio, sendonly, PCMA/8000"]}]},
+    }
+    check("backchannel found on the main stream",
+          livecam.backchannel_stream("baby-ptz", on_main) == "baby-ptz")
+    check("backchannel found on the substream instead",
+          livecam.backchannel_stream("baby-ptz", on_sub) == "baby-ptz_sub")
+    check("no backchannel anywhere returns None, not a wrong guess",
+          livecam.backchannel_stream("baby-ptz", {
+              "baby-ptz": {"producers": [{"medias": ["video, recvonly, H264"]}]}}) is None)
+    check("another camera's backchannel is never borrowed",
+          livecam.backchannel_stream("the-boiz", on_sub) is None)
+    check("a not-yet-connected producer (medias None) is skipped safely",
+          livecam.backchannel_stream("baby-ptz", {
+              "baby-ptz_noaudio": {"producers": [{"medias": None}]}}) is None)
+
     livecam.SOUNDBOARD_DIR = saved_sb_dir
     livecam.CAMERAS_FILE = saved_cameras_file
     livecam.PERMISSIONS_FILE = saved_perms_file
