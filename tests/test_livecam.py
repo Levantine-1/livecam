@@ -390,6 +390,19 @@ def main():
     check("the archive link is shown to users with the grant",
           "/frigate/" in page)
 
+    # Deleting a Frigate export issues DELETE /api/export/<id>. The proxy
+    # route once allowed only GET/POST, so Flask answered 405 before the
+    # request reached Frigate: the delete button appeared to work, the file
+    # stayed, and Frigate logged nothing because nothing arrived. A 405 here
+    # is exactly that regression.
+    for verb in ("delete", "put", "patch"):
+        r = getattr(c, verb)("/frigate/api/export/nonexistent", headers={"Host": PUB})
+        check(f"the Frigate proxy forwards {verb.upper()} instead of refusing it",
+              r.status_code != 405, r.status_code)
+    r = denied.delete("/frigate/api/export/nonexistent", headers={"Host": PUB})
+    check("forwarding DELETE does not bypass the recordings grant",
+          r.status_code == 403, r.status_code)
+
     # --- _proxy() streaming: the actual bug behind intermittent iOS freezes
     # while scrubbing recorded video. Frigate's HLS VOD segments run 8+ MB
     # each, and scrubbing abandons and refetches rapidly; the previous

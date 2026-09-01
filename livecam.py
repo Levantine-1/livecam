@@ -1891,8 +1891,18 @@ def dashboard():
     )
 
 
-@app.route("/frigate/", defaults={"path": ""}, methods=["GET", "POST"])
-@app.route("/frigate/<path:path>", methods=["GET", "POST"])
+# The method list is not decoration. It was GET/POST only, which silently
+# broke every Frigate feature that uses another verb: deleting an export
+# issues DELETE /api/export/<id>, Flask answered 405 before the request ever
+# reached Frigate, and the UI surfaced nothing at all -- the button worked,
+# the file never went away, and Frigate's log showed no DELETE because none
+# ever arrived. Proxying the verbs Frigate's own UI uses does not widen
+# access: this route is already gated on the `recordings` grant below, and
+# _proxy() forwards request.method unchanged.
+@app.route("/frigate/", defaults={"path": ""},
+           methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+@app.route("/frigate/<path:path>",
+           methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
 @login_required
 def frigate(path):
     """Frigate's UI: recordings, the scrub timeline, and export.
