@@ -52,6 +52,36 @@
   #gainWrap[hidden] { display:none; }
   #gainWrap { display:flex; align-items:center; gap:.4rem; font-size:.75rem; color:#9aa3b2; }
   #gain { width:90px; }
+  /* --- soundboard dialog --- */
+  #soundboard { width:min(30rem, 92vw); }
+  #soundboard .sbHead { display:flex; align-items:center; gap:1rem; margin-bottom:.75rem; }
+  #soundboard .sbHead strong { flex:1; }
+  #soundboard button { margin-top:0; }
+  .sbNote { color:#9aa3b2; font-size:.75rem; margin:.25rem 0 0; }
+  .sbVolume, .sbRecord, .sbClips { padding:.75rem 0; border-top:1px solid #2a2f3a; }
+  .sbVolume { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; font-size:.8rem; }
+  .sbVolume #sbVol { flex:1; min-width:8rem; }
+  .sbVolume .sbNote { flex-basis:100%; }
+  .sbReviewBtns { display:flex; gap:.5rem; flex-wrap:wrap; margin-top:.5rem; }
+  #sbPreview { width:100%; margin-top:.5rem; }
+  #sbRecBtn.on { background:#c0392b; }
+  #sbList { list-style:none; margin:.4rem 0; padding:0; max-height:12rem; overflow-y:auto; }
+  #sbList li { display:flex; align-items:center; gap:.5rem; padding:.25rem 0; font-size:.85rem; }
+  #sbList li span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #sbList button { padding:.25rem .6rem; font-size:.75rem; }
+  #sbList .sbDel { background:#4a2f2f; }
+  .sbUpload { display:inline-block; margin-top:.5rem; padding:.45rem .9rem; border-radius:6px;
+              background:#2a2f3a; font-size:.8rem; cursor:pointer; }
+  /* The bar is a single non-wrapping flex row, which is fine on a desktop
+     but runs out of width on a phone: with a talk+PTZ+audio camera it holds
+     the name, three badges and six controls, and `.right`'s margin-left:auto
+     then pushes the buttons off-screen entirely rather than overflowing
+     visibly. Letting it wrap keeps every control reachable, and scales on its
+     own as more buttons are added. Same approach .banner already uses. */
+  @media (max-width: 700px) {
+    #overlay .bar { flex-wrap:wrap; row-gap:.4rem; }
+    #overlay .bar .right { margin-left:0; width:100%; flex-wrap:wrap; }
+  }
   .notice { padding:.5rem 1rem; font-size:.8rem; background:#3a2f19; color:#f0d9a8; }
   .notice[hidden] { display:none; }
   .tap[hidden] { display:none; }
@@ -159,6 +189,10 @@
            toggle on a camera with no PTZ. Resets to visible ("Hide PTZ") on
            every camera open, matching ptzPad's own default-visible state. -->
       <button id="ptzToggleBtn" type="button" aria-pressed="true" hidden>Hide PTZ</button>
+      <!-- Speaker controls, shown only for cameras with `talk: true` AND a
+           user `talk` grant. Opens a dialog rather than adding more buttons
+           to this bar, which is already the thing that overflows on a phone. -->
+      <button id="talkBtn" type="button" hidden>&#128266; Speak</button>
       <!-- Both are rendered because audio is granted per camera: which one
            applies depends on which camera is expanded, not on the account.
            Sound is off until asked for, and asking is a click -- that click
@@ -205,6 +239,50 @@
   <button id="resume">Resume</button>
 </dialog>
 
+<!-- Soundboard. Everything that makes noise in the room lives behind this one
+     dialog, deliberately: it keeps the overlay bar (which already overflows on
+     a phone) from growing, and it puts the volume control next to the sounds
+     it affects. -->
+<dialog id="soundboard">
+  <div class="sbHead">
+    <strong>Speak through <span id="sbCamera"></span></strong>
+    <button id="sbClose" type="button">Close</button>
+  </div>
+
+  <div class="sbVolume">
+    <label for="sbVol">Speaker volume</label>
+    <input id="sbVol" type="range" min="0" max="100" step="1" value="50">
+    <span id="sbVolVal">&mdash;</span>
+    <!-- Worth stating plainly: this is a setting on the camera, not a
+         per-viewer preference, so it stays where it's left for everyone. -->
+    <p class="sbNote">Changes the camera itself &mdash; affects everyone, and persists.</p>
+  </div>
+
+  <div class="sbRecord">
+    <button id="sbRecBtn" type="button">&#127908; Record</button>
+    <span id="sbRecState" class="sbNote"></span>
+    <div id="sbReview" hidden>
+      <audio id="sbPreview" controls></audio>
+      <div class="sbReviewBtns">
+        <button id="sbSend" type="button">Send once</button>
+        <button id="sbSave" type="button">Save to soundboard</button>
+        <button id="sbDiscard" type="button">Discard</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="sbClips">
+    <strong class="sbNote">Saved clips</strong>
+    <ul id="sbList"></ul>
+    <label class="sbUpload">
+      Upload a clip
+      <input id="sbFile" type="file" accept="audio/*" hidden>
+    </label>
+  </div>
+
+  <p class="notice" id="sbStatus" hidden></p>
+</dialog>
+
 {% include "_lan_switch.html" %}
 
 <script>
@@ -242,6 +320,9 @@ const AUDIO_CAMERAS = new Set({{ audio_cameras | tojson }});
 // independent gates (a config flag AND a permission grant) that both have
 // to be true before a camera ever lands in this set.
 const PTZ_CAMERAS = new Set({{ ptz_cameras | tojson }});
+// Cameras this user may push audio to -- again both gates (a `talk: true`
+// capability flag AND a `talk` grant). Only cameras with a real speaker.
+const TALK_CAMERAS = new Set({{ talk_cameras | tojson }});
 const LABELS = Object.fromEntries(
   Array.from(document.querySelectorAll('#grid figure'))
        .map(f => [f.dataset.camera, f.querySelector('figcaption').textContent.trim()]));
@@ -550,6 +631,8 @@ function expand(cam) {
     ptzToggleBtn.textContent = 'Hide PTZ';
   }
   if (canPtz) ptzLoadPresets(cam); else { ptzPresetsEl.hidden = true; ptzPresetsEl.innerHTML = ''; }
+  // Speaker controls follow the same per-camera rule as PTZ and sound.
+  if (talkBtn) talkBtn.hidden = !TALK_CAMERAS.has(cam);
   overlay.hidden = false;
   say('');
   // Muted and audio-free by default. Sound is a separate, explicit act --
@@ -615,6 +698,10 @@ function collapse() {
   // camera creeping after the UI it was controlled from is gone.
   ptzStopActive();
   ptzPad.hidden = true;
+  // Same reasoning for the soundboard: it acts on `current`, so it must not
+  // outlive the expanded view it belongs to (its own close handler stops any
+  // in-flight recording).
+  if (sbDlg && sbDlg.open) sbDlg.close();
   overlay.hidden = true;
   say('');
   current = null;
@@ -806,6 +893,222 @@ async function ptzLoadPresets(cam) {
 ptzPresetsEl.addEventListener('change', () => {
   if (current && ptzPresetsEl.value) ptzSend(current, `preset_${ptzPresetsEl.value}`);
   ptzPresetsEl.selectedIndex = 0;
+});
+
+// --- soundboard -----------------------------------------------------------
+// Plays audio out of the camera's own speaker. The browser never streams
+// audio anywhere: a clip is either already stored server-side, or recorded
+// here and uploaded as a file. The server hands go2rtc a URL and go2rtc
+// pushes it down the camera's ONVIF backchannel -- so this works identically
+// on the LAN and remotely, with no WebRTC or microphone streaming involved.
+const sbDlg = document.getElementById('soundboard');
+const talkBtn = document.getElementById('talkBtn');
+const sbCameraEl = document.getElementById('sbCamera');
+const sbListEl = document.getElementById('sbList');
+const sbStatusEl = document.getElementById('sbStatus');
+const sbVol = document.getElementById('sbVol');
+const sbVolVal = document.getElementById('sbVolVal');
+const sbRecBtn = document.getElementById('sbRecBtn');
+const sbRecState = document.getElementById('sbRecState');
+const sbReview = document.getElementById('sbReview');
+const sbPreview = document.getElementById('sbPreview');
+const sbFile = document.getElementById('sbFile');
+
+let recorder = null, recChunks = [], recBlob = null;
+
+function sbSay(msg, isError) {
+  if (!msg) { sbStatusEl.hidden = true; return; }
+  sbStatusEl.textContent = msg;
+  sbStatusEl.hidden = false;
+  sbStatusEl.style.background = isError ? '#4a2f2f' : '#3a2f19';
+}
+
+function fmtBytes(n) {
+  return n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.round(n / 1e3)} KB`;
+}
+
+async function sbLoadClips() {
+  sbListEl.innerHTML = '';
+  try {
+    const r = await fetch('/soundboard');
+    if (!r.ok) return;
+    const { clips } = await r.json();
+    if (!clips.length) {
+      sbListEl.innerHTML = '<li class="sbNote">No clips yet.</li>';
+      return;
+    }
+    clips.forEach(c => {
+      const li = document.createElement('li');
+      const name = document.createElement('span');
+      name.textContent = `${c.label} (${fmtBytes(c.bytes)})`;
+      const play = document.createElement('button');
+      play.type = 'button';
+      play.textContent = '▶ Play';
+      play.addEventListener('click', () => sbPlay(c.id));
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'sbDel';
+      del.textContent = 'Delete';
+      // Confirm first: this list is finger-sized on a phone and a stray tap
+      // would otherwise destroy a saved clip with no undo.
+      del.addEventListener('click', () => {
+        if (confirm(`Delete "${c.label}"? This cannot be undone.`)) sbDelete(c.id);
+      });
+      li.append(name, play, del);
+      sbListEl.appendChild(li);
+    });
+  } catch (e) { sbSay('Could not load clips.', true); }
+}
+
+async function sbPlay(clipId) {
+  if (!current) return;
+  sbSay('Playing…');
+  try {
+    const r = await fetch(`/talk/${encodeURIComponent(current)}/play`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clip: clipId }),
+    });
+    const data = await r.json().catch(() => ({}));
+    sbSay(r.ok ? 'Played.' : (data.error || `Failed (${r.status}).`), !r.ok);
+  } catch (e) { sbSay('Network error.', true); }
+}
+
+async function sbDelete(clipId) {
+  try {
+    const r = await fetch(`/soundboard/${encodeURIComponent(clipId)}`, { method: 'DELETE' });
+    if (!r.ok) { sbSay(`Could not delete (${r.status}).`, true); return; }
+    sbSay('Deleted.');
+    sbLoadClips();
+  } catch (e) { sbSay('Network error.', true); }
+}
+
+sbFile.addEventListener('change', async () => {
+  const file = sbFile.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append('clip', file);
+  sbSay('Uploading…');
+  try {
+    const r = await fetch('/soundboard/upload', { method: 'POST', body: form });
+    const data = await r.json().catch(() => ({}));
+    sbSay(r.ok ? 'Uploaded.' : (data.error || `Upload failed (${r.status}).`), !r.ok);
+    if (r.ok) sbLoadClips();
+  } catch (e) { sbSay('Network error.', true); }
+  sbFile.value = '';
+});
+
+// --- recording: capture locally, review, then decide what to do with it ---
+sbRecBtn.addEventListener('click', async () => {
+  if (recorder && recorder.state === 'recording') { recorder.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recChunks = [];
+    recorder = new MediaRecorder(stream);
+    recorder.ondataavailable = e => { if (e.data.size) recChunks.push(e.data); };
+    recorder.onstop = () => {
+      // Release the mic as soon as recording ends -- leaving tracks live
+      // keeps the browser's recording indicator on and holds the device.
+      stream.getTracks().forEach(t => t.stop());
+      recBlob = new Blob(recChunks, { type: recorder.mimeType || 'audio/webm' });
+      sbPreview.src = URL.createObjectURL(recBlob);
+      sbReview.hidden = false;
+      sbRecBtn.classList.remove('on');
+      sbRecBtn.innerHTML = '\u{1F3A4} Record';
+      sbRecState.textContent = 'Review it below before sending.';
+    };
+    recorder.start();
+    sbRecBtn.classList.add('on');
+    sbRecBtn.innerHTML = '⏹ Stop';
+    sbRecState.textContent = 'Recording…';
+    sbReview.hidden = true;
+  } catch (e) {
+    sbSay('Microphone unavailable (permission denied, or the page needs HTTPS).', true);
+  }
+});
+
+async function sbUploadRecording(save) {
+  if (!recBlob || !current) return;
+  // The extension has to match what MediaRecorder actually produced, since
+  // the server validates on it -- Chrome gives webm, Safari mp4/m4a.
+  const type = recBlob.type || '';
+  const ext = type.includes('mp4') || type.includes('m4a') ? '.m4a'
+            : type.includes('ogg') ? '.ogg' : '.webm';
+  const form = new FormData();
+  form.append('clip', recBlob, `recording${ext}`);
+  if (save) form.append('save', '1');
+  sbSay(save ? 'Saving and playing…' : 'Sending…');
+  try {
+    const r = await fetch(`/talk/${encodeURIComponent(current)}/say`, {
+      method: 'POST', body: form,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) { sbSay(data.error || `Failed (${r.status}).`, true); return; }
+    sbSay(save ? 'Sent and saved to the soundboard.' : 'Sent.');
+    sbReview.hidden = true;
+    recBlob = null;
+    if (save) sbLoadClips();
+  } catch (e) { sbSay('Network error.', true); }
+}
+
+document.getElementById('sbSend').addEventListener('click', () => sbUploadRecording(false));
+document.getElementById('sbSave').addEventListener('click', () => sbUploadRecording(true));
+document.getElementById('sbDiscard').addEventListener('click', () => {
+  sbReview.hidden = true;
+  recBlob = null;
+  sbRecState.textContent = '';
+  sbSay('');
+});
+
+// --- speaker volume ---
+let sbVolTimer = null;
+sbVol.addEventListener('input', () => {
+  sbVolVal.textContent = sbVol.value;
+  // Debounced: dragging a slider fires continuously, and each commit is an
+  // ONVIF round-trip to the camera.
+  clearTimeout(sbVolTimer);
+  sbVolTimer = setTimeout(async () => {
+    if (!current) return;
+    try {
+      const r = await fetch(`/talk/${encodeURIComponent(current)}/volume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ volume: Number(sbVol.value) }),
+      });
+      if (!r.ok) sbSay(`Could not set volume (${r.status}).`, true);
+    } catch (e) { sbSay('Network error setting volume.', true); }
+  }, 400);
+});
+
+async function sbLoadVolume() {
+  sbVolVal.textContent = '—';
+  try {
+    const r = await fetch(`/talk/${encodeURIComponent(current)}/volume`);
+    if (!r.ok) return;
+    const { volume } = await r.json();
+    if (volume !== null && volume !== undefined) {
+      sbVol.value = volume;
+      sbVolVal.textContent = volume;
+    }
+  } catch (e) { /* leave the dash; the slider still works */ }
+}
+
+if (talkBtn) {
+  talkBtn.addEventListener('click', () => {
+    if (!current) return;
+    sbCameraEl.textContent = LABELS[current] || current;
+    sbSay('');
+    sbReview.hidden = true;
+    sbRecState.textContent = '';
+    sbDlg.showModal();
+    sbLoadClips();
+    sbLoadVolume();
+  });
+}
+document.getElementById('sbClose').addEventListener('click', () => sbDlg.close());
+// Closing while a recording is in flight must not leave the mic live.
+sbDlg.addEventListener('close', () => {
+  if (recorder && recorder.state === 'recording') recorder.stop();
 });
 
 // Esc and the close button both go through history.back(), so every exit

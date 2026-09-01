@@ -316,17 +316,17 @@ def main():
           "TRANSPORT_TIMEOUT_MS" in page and "_abandonStream" in page)
 
     perms = livecam.load_permissions()
-    allowed, audio, ptz = livecam.check_permission("admin", perms)
+    allowed, audio, ptz, talk = livecam.check_permission("admin", perms)
     check("admin: both cameras, audio on both (bool still means all)",
           allowed == {"the-boiz", "the-gurlz"} and audio == allowed, (allowed, audio))
     check("admin has no ptz grant at all (never set for this user)",
           ptz == set(), ptz)
-    allowed, audio, ptz = livecam.check_permission("guest", perms)
+    allowed, audio, ptz, talk = livecam.check_permission("guest", perms)
     check("guest outside their time window gets nothing",
           allowed == set() and audio == set() and ptz == set(), (allowed, audio, ptz))
 
     # Per-camera audio and ptz, and the intersection that keeps both honest.
-    allowed, audio, ptz = livecam.check_permission("partial", perms)
+    allowed, audio, ptz, talk = livecam.check_permission("partial", perms)
     check("per-camera audio grants only the listed camera",
           allowed == {"the-boiz", "the-gurlz"} and audio == {"the-boiz"}, (allowed, audio))
     check("audio listed for an unseeable camera grants nothing",
@@ -677,7 +677,7 @@ def main():
     check("both gates intersected correctly reach the client",
           "PTZ_CAMERAS = new Set([\"the-boiz\"])" in dash_html, dash_html.count("the-boiz"))
 
-    allowed, _, ptz_cameras = livecam.check_permission("partial", livecam.load_permissions())
+    allowed, _, ptz_cameras, _ = livecam.check_permission("partial", livecam.load_permissions())
     check("ptz grant intersected with cameras (baby-cam unseeable, dropped)",
           ptz_cameras == {"the-boiz", "the-gurlz"}, ptz_cameras)
     check("config-flag gate: only the-boiz is actually declared PTZ-capable",
@@ -780,6 +780,142 @@ def main():
     r = part.post("/ptz/the-boiz", json={"command": "preset_nonexistent"}, headers={"Host": LAN})
     check("an unknown preset name is refused server-side, not trusted from the request",
           r.status_code == 400, r.status_code)
+
+    # --- soundboard / talking to a camera's speaker ---
+    # The audio path itself (go2rtc -> ONVIF backchannel) is not exercised
+    # here: go2rtc is pointed at an unroutable host, and a real play makes
+    # noise in an actual room. What's checked is everything this app decides
+    # on its own -- both permission gates, clip-id handling, upload
+    # validation and the signed-URL scheme that lets go2rtc fetch a clip
+    # without a session.
+    check("talk capability is opt-in per camera, unlike ptz which defaults on",
+          livecam.talk_capable_cameras() == set()
+          and livecam.ptz_capable_cameras() == {"the-boiz"},
+          (livecam.talk_capable_cameras(), livecam.ptz_capable_cameras()))
+
+    saved_cameras_file = livecam.CAMERAS_FILE
+    talk_cfg = os.path.join(WORK, "cameras_talk.yml")
+    with open(talk_cfg, "w") as f:
+        f.write("cameras:\n"
+                "  the-boiz:\n"
+                "    ip: 10.69.69.107\n"
+                "    talk: true\n"
+                # Declared PTZ-capable but explicitly NOT a speaker, so the
+                # two capabilities are proven independent.
+                "  the-gurlz:\n"
+                "    ip: 10.69.69.143\n")
+    livecam.CAMERAS_FILE = talk_cfg
+    check("only cameras with talk:true are speakable",
+          livecam.talk_capable_cameras() == {"the-boiz"}, livecam.talk_capable_cameras())
+    check("a camera without talk:true still counts as PTZ-capable",
+          livecam.ptz_capable_cameras() == {"the-boiz", "the-gurlz"},
+          livecam.ptz_capable_cameras())
+
+    # `partial` has no `talk` grant at all, so the capability alone must not
+    # be enough -- the mirror of the PTZ "both gates" test above.
+    r = part.post("/talk/the-boiz/play", json={"clip": "x.wav"}, headers={"Host": LAN})
+    check("capability without a talk grant is refused", r.status_code == 403, r.status_code)
+
+    talk_perms = os.path.join(WORK, "permissions_talk.yml")
+    with open(PERMS) as f:
+        talk_body = f.read()
+    with open(talk_perms, "w") as f:
+        f.write(talk_body.replace(
+            "  ptz: [the-boiz, the-gurlz, baby-cam]\n",
+            "  ptz: [the-boiz, the-gurlz, baby-cam]\n  talk: [the-boiz, the-gurlz]\n"))
+    saved_perms_file = livecam.PERMISSIONS_FILE
+    livecam.PERMISSIONS_FILE = talk_perms
+    livecam.load_permissions.cache_clear() if hasattr(livecam.load_permissions, "cache_clear") else None
+
+    _, _, _, talk_grant = livecam.check_permission("partial", livecam.load_permissions())
+    check("talk grant is intersected with visible cameras like audio/ptz",
+          talk_grant == {"the-boiz", "the-gurlz"}, talk_grant)
+
+    # the-gurlz is granted but has no speaker declared -> still refused.
+    r = part.post("/talk/the-gurlz/play", json={"clip": "x.wav"}, headers={"Host": LAN})
+    check("a grant on a camera with no speaker is refused",
+          r.status_code == 403, r.status_code)
+
+    # Clip ids come off the wire, so traversal and odd extensions are refused
+    # before anything touches the filesystem.
+    check("clip ids may not traverse directories",
+          livecam._clip_path("../../etc/passwd") is None
+          and livecam._clip_path("sub/dir.wav") is None
+          and livecam._clip_path(".hidden.wav") is None)
+    check("clip ids must carry a known audio extension",
+          livecam._clip_path("evil.sh") is None
+          and livecam._clip_path("fine.wav", ) is not None)
+
+    saved_sb_dir = livecam.SOUNDBOARD_DIR
+    livecam.SOUNDBOARD_DIR = os.path.join(WORK, "soundboard")
+    os.makedirs(livecam.SOUNDBOARD_DIR, exist_ok=True)
+    with open(os.path.join(livecam.SOUNDBOARD_DIR, "hello.wav"), "wb") as f:
+        f.write(b"RIFF....WAVEfake")
+    check("stored clips are listed", [c["id"] for c in livecam.soundboard_clips()] == ["hello.wav"],
+          livecam.soundboard_clips())
+
+    # The signed URL is what authorises go2rtc, which arrives with no session.
+    token = livecam._soundboard_serializer().dumps("hello.wav")
+    anon = app.test_client()
+    r = anon.get(f"/soundboard/raw/{token}", headers={"Host": LAN})
+    check("a validly-signed clip URL serves without a session (go2rtc has none)",
+          r.status_code == 200 and r.data == b"RIFF....WAVEfake", r.status_code)
+    r = anon.get("/soundboard/raw/not-a-real-token", headers={"Host": LAN})
+    check("a forged clip token is refused", r.status_code == 403, r.status_code)
+    r = anon.get(f"/soundboard/raw/{livecam._soundboard_serializer().dumps('nope.wav')}",
+                 headers={"Host": LAN})
+    check("a signed token for a missing clip is a 404, not a 500", r.status_code == 404,
+          r.status_code)
+
+    # Uploading is gated on `recordings`, a higher bar than playing.
+    import io
+    r = part.post("/soundboard/upload", headers={"Host": LAN},
+                  data={"clip": (io.BytesIO(b"xx"), "x.wav")},
+                  content_type="multipart/form-data")
+    check("upload refused without the recordings grant", r.status_code == 403, r.status_code)
+
+    admin_c = app.test_client()
+    admin_c.post("/login", data={"username": "admin", "password": PASSWORD}, headers={"Host": LAN})
+    r = admin_c.post("/soundboard/upload", headers={"Host": LAN},
+                     data={"clip": (io.BytesIO(b"nope"), "payload.sh")},
+                     content_type="multipart/form-data")
+    check("upload refuses a non-audio extension", r.status_code == 400, r.status_code)
+
+    saved_max = livecam.SOUNDBOARD_MAX_BYTES
+    livecam.SOUNDBOARD_MAX_BYTES = 4
+    r = admin_c.post("/soundboard/upload", headers={"Host": LAN},
+                     data={"clip": (io.BytesIO(b"way too many bytes"), "big.wav")},
+                     content_type="multipart/form-data")
+    check("upload refuses a clip over the size cap", r.status_code == 400, r.status_code)
+    check("an over-size upload is not left on disk",
+          not os.path.exists(os.path.join(livecam.SOUNDBOARD_DIR, "big.wav")))
+    livecam.SOUNDBOARD_MAX_BYTES = saved_max
+
+    r = admin_c.post("/soundboard/upload", headers={"Host": LAN},
+                     data={"clip": (io.BytesIO(b"RIFFdata"), "Nice Clip!.wav")},
+                     content_type="multipart/form-data")
+    check("a valid upload is accepted", r.status_code == 201, r.status_code)
+    check("upload filenames are sanitised to a flat safe name",
+          "Nice_Clip.wav" in [c["id"] for c in livecam.soundboard_clips()],
+          livecam.soundboard_clips())
+
+    r = admin_c.delete("/soundboard/Nice_Clip.wav", headers={"Host": LAN})
+    check("delete removes only the targeted clip",
+          r.status_code == 200
+          and [c["id"] for c in livecam.soundboard_clips()] == ["hello.wav"],
+          livecam.soundboard_clips())
+    r = admin_c.delete("/soundboard/hello.wav/../../etc/passwd", headers={"Host": LAN})
+    check("delete refuses a traversing id", r.status_code in (400, 404), r.status_code)
+
+    # Volume is clamped server-side; the slider's range is a UI hint, not a
+    # guarantee, since the request is trivially forgeable.
+    for bad in (-5, 101, "loud", None):
+        r = part.post("/talk/the-boiz/volume", json={"volume": bad}, headers={"Host": LAN})
+        check(f"volume {bad!r} is refused", r.status_code == 400, r.status_code)
+
+    livecam.SOUNDBOARD_DIR = saved_sb_dir
+    livecam.CAMERAS_FILE = saved_cameras_file
+    livecam.PERMISSIONS_FILE = saved_perms_file
 
     # --- LAN switch: ping, handoff ---
     fresh = app.test_client()

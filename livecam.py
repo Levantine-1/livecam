@@ -88,6 +88,34 @@ CAMERAS_FILE = os.environ.get("CAMERAS_FILE", "/app/config/cameras.yml")
 CAMERA_USERNAME = os.environ.get("CAMERA_USERNAME")
 CAMERA_PASSWORD = os.environ.get("CAMERA_PASSWORD")
 
+# --- Soundboard / talking to a camera's speaker -----------------------------
+# Clips live on the one writable mount (/opt/livecam/data on the host), NOT
+# beside the read-only configs, so they survive the container being recreated
+# on every CI/CD deploy.
+SOUNDBOARD_DIR = os.environ.get("SOUNDBOARD_DIR", "/app/data/soundboard")
+SOUNDBOARD_MAX_BYTES = int(os.environ.get("SOUNDBOARD_MAX_BYTES", str(5 * 1024 ** 2)))
+# Whatever the browser can record or a person is likely to upload. go2rtc's
+# ffmpeg does the decode, so this list is about refusing obvious junk rather
+# than about what can be played.
+SOUNDBOARD_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus", ".aac", ".webm", ".flac"}
+
+# go2rtc fetches clips over HTTP by URL, because it runs on the Frigate VM and
+# cannot see this container's filesystem. It therefore needs an address that
+# resolves from *there*, not from the browser -- hence its own setting rather
+# than reusing a request's Host header.
+_lan_host_env = os.environ.get("LAN_HOSTNAME", "")
+TALK_CLIP_BASE_URL = os.environ.get(
+    "TALK_CLIP_BASE_URL", f"http://{_lan_host_env}" if _lan_host_env else ""
+).rstrip("/")
+# How long a signed clip URL stays valid. Only has to outlive one go2rtc fetch.
+TALK_CLIP_TTL_SECONDS = int(os.environ.get("TALK_CLIP_TTL_SECONDS", "120"))
+# These cameras expose exactly ONE talk channel, already held open by go2rtc's
+# main connection, so two overlapping plays would fight over it. Playback is
+# serialised per camera and rate-limited rather than queued: a soundboard is
+# for one deliberate sound at a time, and dropping a double-tap is friendlier
+# than stacking noises in a room.
+TALK_MIN_GAP_SECONDS = float(os.environ.get("TALK_MIN_GAP_SECONDS", "1.5"))
+
 # Which hostname served this request decides two things: whether to nudge the
 # viewer towards the LAN URL, and whether the bytes count as billable AWS
 # egress. Both hang off the same signal.
@@ -390,15 +418,39 @@ def load_camera_config():
     return cameras if isinstance(cameras, dict) else {}
 
 
-def ptz_capable_cameras():
-    """Camera names with PTZ config declared -- the config-side gate.
+def _capable_cameras(flag, default):
+    """Camera names whose cameras.yml entry enables `flag` -- the config-side gate.
 
-    Independent of any user's `ptz` permission grant: both are required.
-    A camera absent here has no PTZ regardless of what any permissions.yml
-    entry says, and a user without the grant can't control a camera that
-    is present here either.
+    Independent of any user's permission grant: both are required. A camera
+    absent here has the capability regardless of what any permissions.yml
+    entry says, and a user without the grant can't reach a camera that is
+    present here either.
+
+    `default` exists because `ptz` predates any capability flags: every entry
+    in cameras.yml was, by definition, a PTZ camera, so presence alone meant
+    PTZ and existing entries have no `ptz:` key to read. Newer capabilities
+    default off, so declaring a talk-only camera doesn't silently hand it PTZ.
     """
-    return set(load_camera_config())
+    return {
+        name for name, config in load_camera_config().items()
+        if (config or {}).get(flag, default)
+    }
+
+
+def ptz_capable_cameras():
+    """Camera names with PTZ declared. Defaults on for backwards compatibility
+    -- see _capable_cameras()."""
+    return _capable_cameras("ptz", True)
+
+
+def talk_capable_cameras():
+    """Camera names with a speaker declared (`talk: true` in cameras.yml).
+
+    Defaults off, unlike PTZ: a camera having an ONVIF/PTZ entry says nothing
+    about whether it has a speaker, and pushing audio at one that doesn't
+    should not be reachable by accident.
+    """
+    return _capable_cameras("talk", False)
 
 
 def user_entries(permissions):
@@ -597,7 +649,7 @@ def handoff():
 def _intersect_grant(cameras, value):
     """Resolve a true/false/list-shaped grant against the cameras a user may see.
 
-    Shared by `audio` and `ptz`, which both follow the same shape:
+    Shared by `audio`, `ptz` and `talk`, which all follow the same shape:
 
         true                 -> every permitted camera
         false                -> none
@@ -613,27 +665,29 @@ def _intersect_grant(cameras, value):
 
 
 def check_permission(username, permissions, now=None):
-    """Return (allowed_cameras, audio_cameras, ptz_cameras) for this user right now.
+    """Return (allowed_cameras, audio_cameras, ptz_cameras, talk_cameras) for this user now.
 
     The time window is evaluated per request, not once at login, so a lapsed
-    grant actually cuts a stream (or PTZ control) off mid-session.
+    grant actually cuts a stream (or PTZ control, or the ability to push audio
+    at a camera) off mid-session.
     """
     now = now or datetime.now()
     user_perms = user_entries(permissions).get(username)
     if not user_perms:
-        return set(), set(), set()
+        return set(), set(), set(), set()
 
     window = user_perms.get("time_window")
     if window:
         start = dtime.fromisoformat(window["start"])
         end = dtime.fromisoformat(window["end"])
         if not (start <= now.time() <= end):
-            return set(), set(), set()
+            return set(), set(), set(), set()
 
     cameras = set(user_perms.get("cameras", []))
     audio_cameras = _intersect_grant(cameras, user_perms.get("audio", False))
     ptz_cameras = _intersect_grant(cameras, user_perms.get("ptz", False))
-    return cameras, audio_cameras, ptz_cameras
+    talk_cameras = _intersect_grant(cameras, user_perms.get("talk", False))
+    return cameras, audio_cameras, ptz_cameras, talk_cameras
 
 
 def _prune_stale_sessions():
@@ -805,7 +859,7 @@ def _authorise_hls(session_id):
         entry["seen"] = time.time()
         camera, metered = entry["camera"], entry["metered"]
 
-    allowed, _, _ = check_permission(current_user(), load_permissions())
+    allowed, _, _, _ = check_permission(current_user(), load_permissions())
     if camera not in allowed:
         abort(403)
     return camera, metered
@@ -821,7 +875,7 @@ def live_hls(camera):
     suffix swallowed into the camera name.
     """
     username = current_user()
-    allowed_cameras, audio_cameras, _ = check_permission(username, load_permissions())
+    allowed_cameras, audio_cameras, _, _ = check_permission(username, load_permissions())
     if camera not in allowed_cameras:
         abort(403)
 
@@ -965,7 +1019,7 @@ def live(camera):
     username = current_user()
 
     permissions = load_permissions()
-    allowed_cameras, audio_cameras, _ = check_permission(username, permissions)
+    allowed_cameras, audio_cameras, _, _ = check_permission(username, permissions)
     if camera not in allowed_cameras:
         abort(403)
 
@@ -1029,7 +1083,7 @@ def live(camera):
                 if last_seen is None or time.time() - last_seen > session_timeout:
                     why = "heartbeat expired"
                     break
-                still_allowed, _, _ = check_permission(username, load_permissions())
+                still_allowed, _, _, _ = check_permission(username, load_permissions())
                 if camera not in still_allowed:
                     why = "permission revoked"
                     break
@@ -1187,9 +1241,48 @@ async def _get_ptz_client(camera):
         # it just means the preset dropdown has nothing to show.
         log.warning("ptz presets unavailable camera=%s", camera, exc_info=True)
 
-    client = {"ptz": ptz, "profile_token": profile.token, "presets": presets}
+    # `media` is cached alongside the PTZ service because speaker volume lives
+    # on the media service (GetAudioOutputConfigurations), and reconnecting a
+    # whole second ONVIF session just to read a number would be wasteful --
+    # this connection is already authenticated and open.
+    client = {"ptz": ptz, "media": media, "profile_token": profile.token,
+              "presets": presets}
     _ptz_clients[camera] = client
     return client
+
+
+async def _audio_output_config(camera):
+    """The camera's first ONVIF audio output configuration, or None.
+
+    Absence is not an error: it just means this camera has no speaker to
+    control, which is the normal case for the fixed cameras.
+    """
+    client = await _get_ptz_client(camera)
+    configs = await client["media"].GetAudioOutputConfigurations()
+    return configs[0] if configs else None
+
+
+async def _get_speaker_volume(camera):
+    cfg = await _audio_output_config(camera)
+    return None if cfg is None else int(cfg.OutputLevel)
+
+
+async def _set_speaker_volume(camera, level):
+    """Set the speaker's ONVIF OutputLevel (0-100).
+
+    The whole configuration object is round-tripped rather than sending
+    OutputLevel alone: SetAudioOutputConfiguration *replaces* the
+    configuration, so omitting fields (SendPrimacy, token) would blank them.
+    """
+    client = await _get_ptz_client(camera)
+    cfg = await _audio_output_config(camera)
+    if cfg is None:
+        raise LookupError(f"{camera} has no ONVIF audio output")
+    cfg.OutputLevel = level
+    await client["media"].SetAudioOutputConfiguration(
+        {"Configuration": cfg, "ForcePersistence": True}
+    )
+    return level
 
 
 async def _ptz_command(camera, command):
@@ -1234,9 +1327,149 @@ def _authorise_ptz(camera):
     user's grant; a user without the grant can't control a camera that is
     declared. Neither alone is enough.
     """
-    _, _, ptz_cameras = check_permission(current_user(), load_permissions())
+    _, _, ptz_cameras, _ = check_permission(current_user(), load_permissions())
     if camera not in (ptz_cameras & ptz_capable_cameras()):
         abort(403)
+
+
+def _authorise_talk(camera):
+    """Both gates for pushing audio at a camera: the grant AND the capability.
+
+    Same shape as _authorise_ptz above. A camera without `talk: true` in
+    CAMERAS_FILE has no speaker as far as this app is concerned, no matter
+    what any permissions.yml entry claims.
+    """
+    _, _, _, talk_cameras = check_permission(current_user(), load_permissions())
+    if camera not in (talk_cameras & talk_capable_cameras()):
+        abort(403)
+
+
+# --------------------------------------------------------------------------
+# Soundboard: short audio clips stored on the writable mount, played out of a
+# camera's speaker.
+#
+# Nothing here decodes or transcodes audio. go2rtc already holds the camera's
+# ONVIF backchannel open on its main stream (verified live: that producer
+# reports an `audio, sendonly, PCMA/8000` track), so playing a clip is one
+# POST asking go2rtc to pull the file and push it down that track. See
+# _play_clip() for the exact call, and the note in the Frigate role's
+# config.yml.j2 for why no dedicated talk stream exists.
+# --------------------------------------------------------------------------
+_talk_lock = threading.Lock()
+_talk_last_played = {}     # camera -> epoch of the last accepted play
+
+
+def _soundboard_serializer():
+    return URLSafeTimedSerializer(app.secret_key, salt="livecam-soundboard")
+
+
+def _clip_path(clip_id):
+    """Absolute path for a clip id, or None if the id is not a plain filename.
+
+    The id comes off the wire, so anything with a separator or a parent
+    reference is refused outright rather than normalised -- clips are always
+    flat files directly inside SOUNDBOARD_DIR.
+    """
+    if not clip_id or clip_id != os.path.basename(clip_id) or clip_id.startswith("."):
+        return None
+    if os.path.splitext(clip_id)[1].lower() not in SOUNDBOARD_EXTENSIONS:
+        return None
+    return os.path.join(SOUNDBOARD_DIR, clip_id)
+
+
+def soundboard_clips():
+    """Every stored clip, newest first. Missing directory means none yet."""
+    try:
+        names = os.listdir(SOUNDBOARD_DIR)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        log.warning("soundboard directory unreadable at %s", SOUNDBOARD_DIR, exc_info=True)
+        return []
+
+    clips = []
+    for name in names:
+        path = _clip_path(name)
+        if not path or not os.path.isfile(path):
+            continue
+        stat = os.stat(path)
+        clips.append({
+            "id": name,
+            "label": os.path.splitext(name)[0].replace("_", " "),
+            "bytes": stat.st_size,
+            "added": int(stat.st_mtime),
+        })
+    return sorted(clips, key=lambda c: c["added"], reverse=True)
+
+
+def _safe_clip_name(raw, fallback_ext):
+    """Turn a user-supplied label into a flat, predictable filename."""
+    stem = os.path.splitext(os.path.basename(raw or ""))[0]
+    stem = re.sub(r"[^A-Za-z0-9 _-]+", "", stem).strip().replace(" ", "_")[:48]
+    if not stem:
+        stem = f"clip_{int(time.time())}"
+    ext = fallback_ext if fallback_ext in SOUNDBOARD_EXTENSIONS else ".wav"
+    name = f"{stem}{ext}"
+    # Never silently overwrite an existing clip with the same name.
+    counter = 2
+    while os.path.exists(os.path.join(SOUNDBOARD_DIR, name)):
+        name = f"{stem}_{counter}{ext}"
+        counter += 1
+    return name
+
+
+def _store_clip(file_storage, label=None):
+    """Persist an uploaded/recorded clip. Returns its id, or raises ValueError."""
+    ext = os.path.splitext(file_storage.filename or "")[1].lower()
+    if ext not in SOUNDBOARD_EXTENSIONS:
+        raise ValueError(f"unsupported audio type: {ext or '(none)'}")
+
+    os.makedirs(SOUNDBOARD_DIR, exist_ok=True)
+    name = _safe_clip_name(label or file_storage.filename, ext)
+    path = os.path.join(SOUNDBOARD_DIR, name)
+    file_storage.save(path)
+
+    # Size is enforced after the write rather than from Content-Length, which
+    # a client controls and can lie about.
+    if os.path.getsize(path) > SOUNDBOARD_MAX_BYTES:
+        os.remove(path)
+        raise ValueError(f"clip exceeds {SOUNDBOARD_MAX_BYTES // 1024 // 1024}MB")
+    return name
+
+
+def _play_clip(camera, clip_id):
+    """Ask go2rtc to push a stored clip down the camera's audio backchannel.
+
+    go2rtc fetches the clip itself over HTTP (it cannot see this filesystem),
+    so the URL is signed and short-lived: that request arrives without a
+    session cookie and must still not expose the soundboard to anyone who
+    guesses the path.
+    """
+    if not TALK_CLIP_BASE_URL:
+        raise RuntimeError("TALK_CLIP_BASE_URL is not configured")
+
+    now = time.time()
+    with _talk_lock:
+        last = _talk_last_played.get(camera, 0)
+        if now - last < TALK_MIN_GAP_SECONDS:
+            raise RuntimeError("a clip is already playing on this camera")
+        _talk_last_played[camera] = now
+
+    token = _soundboard_serializer().dumps(clip_id)
+    clip_url = f"{TALK_CLIP_BASE_URL}/soundboard/raw/{token}"
+    # #audio=pcma makes go2rtc transcode to G.711 A-law, which is what the
+    # backchannel advertises; without it the push is refused as a codec
+    # mismatch.
+    resp = requests.post(
+        f"{GO2RTC_URL}/api/streams",
+        params={"dst": camera, "src": f"ffmpeg:{clip_url}#audio=pcma"},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        log.warning("clip play rejected camera=%s clip=%s status=%s body=%s",
+                    camera, clip_id, resp.status_code, resp.text[:200])
+        raise RuntimeError(f"go2rtc refused the clip ({resp.status_code})")
+    log.info("played clip camera=%s clip=%s user=%s", camera, clip_id, current_user())
 
 
 @app.route("/ptz/<camera>", methods=["POST"])
@@ -1279,18 +1512,192 @@ def ptz_presets(camera):
     return jsonify({"presets": sorted(client["presets"])})
 
 
+# ------------------------------------------------------------- soundboard API
+@app.route("/soundboard")
+@login_required
+def soundboard_list():
+    return jsonify({"clips": soundboard_clips()})
+
+
+@app.route("/soundboard/upload", methods=["POST"])
+@login_required
+def soundboard_upload():
+    """Add a clip. Gated on `recordings`, the existing elevated grant -- a
+    stored clip is playable into a room by anyone with `talk`, so adding one
+    is deliberately a higher bar than playing one."""
+    permissions = load_permissions()
+    if not (user_entries(permissions).get(current_user()) or {}).get("recordings"):
+        abort(403)
+
+    upload = request.files.get("clip")
+    if upload is None or not upload.filename:
+        abort(400)
+    try:
+        clip_id = _store_clip(upload, request.form.get("label"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except OSError:
+        log.exception("could not store clip")
+        abort(500)
+    log.info("soundboard clip added id=%s user=%s", clip_id, current_user())
+    return jsonify({"clip": clip_id, "clips": soundboard_clips()}), 201
+
+
+@app.route("/soundboard/<clip_id>", methods=["DELETE"])
+@login_required
+def soundboard_delete(clip_id):
+    permissions = load_permissions()
+    if not (user_entries(permissions).get(current_user()) or {}).get("recordings"):
+        abort(403)
+
+    path = _clip_path(clip_id)
+    if not path or not os.path.isfile(path):
+        abort(404)
+    try:
+        os.remove(path)
+    except OSError:
+        log.exception("could not delete clip %s", clip_id)
+        abort(500)
+    log.info("soundboard clip deleted id=%s user=%s", clip_id, current_user())
+    return jsonify({"clips": soundboard_clips()})
+
+
+@app.route("/soundboard/raw/<token>")
+def soundboard_raw(token):
+    """Serve a clip's bytes to go2rtc.
+
+    Deliberately NOT @login_required: the caller is go2rtc's ffmpeg on the
+    Frigate VM, which has no session. The signed, short-lived token is the
+    authorisation instead, so a guessed path gets nothing and an intercepted
+    URL stops working within TALK_CLIP_TTL_SECONDS.
+    """
+    try:
+        clip_id = _soundboard_serializer().loads(token, max_age=TALK_CLIP_TTL_SECONDS)
+    except SignatureExpired:
+        abort(410)
+    except BadSignature:
+        abort(403)
+
+    path = _clip_path(clip_id)
+    if not path or not os.path.isfile(path):
+        abort(404)
+    with open(path, "rb") as f:
+        body = f.read()
+    return Response(body, content_type="application/octet-stream")
+
+
+# ------------------------------------------------------- talking to a camera
+@app.route("/talk/<camera>/play", methods=["POST"])
+@login_required
+def talk_play(camera):
+    _authorise_talk(camera)
+
+    clip_id = (request.get_json(silent=True) or {}).get("clip")
+    path = _clip_path(clip_id)
+    if not path or not os.path.isfile(path):
+        abort(404)
+    try:
+        _play_clip(camera, clip_id)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 409
+    except requests.RequestException:
+        log.exception("go2rtc unreachable for clip play camera=%s", camera)
+        abort(502)
+    return jsonify({"ok": True})
+
+
+@app.route("/talk/<camera>/say", methods=["POST"])
+@login_required
+def talk_say(camera):
+    """Play a just-recorded clip once, without keeping it.
+
+    The recording is written to disk because go2rtc fetches it by URL rather
+    than accepting bytes inline, so "ephemeral" means deleted afterwards, not
+    never stored. The delete sits in a finally: a failed play must not leave
+    recordings accumulating on the writable mount.
+    """
+    _authorise_talk(camera)
+
+    upload = request.files.get("clip")
+    if upload is None or not upload.filename:
+        abort(400)
+    try:
+        clip_id = _store_clip(upload, f"say_{int(time.time())}")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    keep = request.form.get("save") == "1"
+    try:
+        _play_clip(camera, clip_id)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 409
+    except requests.RequestException:
+        log.exception("go2rtc unreachable for say camera=%s", camera)
+        abort(502)
+    finally:
+        if not keep:
+            # go2rtc fetches the clip asynchronously, so deleting immediately
+            # would race its download. A short grace period is enough: the
+            # fetch happens within milliseconds of the POST returning.
+            threading.Timer(
+                TALK_CLIP_TTL_SECONDS,
+                lambda p=_clip_path(clip_id): os.path.exists(p) and os.remove(p),
+            ).start()
+    return jsonify({"ok": True, "saved": keep, "clip": clip_id if keep else None})
+
+
+@app.route("/talk/<camera>/volume", methods=["GET", "POST"])
+@login_required
+def talk_volume(camera):
+    """Read or set the camera's speaker volume (ONVIF OutputLevel, 0-100).
+
+    Persistent and camera-wide, not per-user: turning it down affects every
+    viewer and stays that way until changed back.
+    """
+    _authorise_talk(camera)
+
+    # Validation happens BEFORE the try: abort() raises an HTTPException, and
+    # the broad `except Exception` below would otherwise catch a deliberate
+    # 400 and re-report it as a 502 upstream failure.
+    level = None
+    if request.method == "POST":
+        raw = (request.get_json(silent=True) or {}).get("volume")
+        # bool is an int subclass, and True would silently become volume 1.
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+            abort(400)
+        try:
+            level = int(raw)
+        except (TypeError, ValueError):
+            abort(400)
+        if not 0 <= level <= 100:
+            abort(400)
+
+    try:
+        if request.method == "GET":
+            return jsonify({"volume": _run_ptz(_get_speaker_volume(camera))})
+        return jsonify({"volume": _run_ptz(_set_speaker_volume(camera, level))})
+    except LookupError as e:
+        log.warning("speaker volume unavailable camera=%s: %s", camera, e)
+        abort(400)
+    except Exception:
+        log.exception("speaker volume failed camera=%s", camera)
+        abort(502)
+
+
 @app.route("/")
 @login_required
 def dashboard():
     """livecam's own landing page: the permitted cameras, live."""
     username = current_user()
     permissions = load_permissions()
-    allowed_cameras, audio_cameras, ptz_cameras = check_permission(username, permissions)
+    allowed_cameras, audio_cameras, ptz_cameras, talk_cameras = check_permission(username, permissions)
     # Two independent gates, both required: the permission grant above, and
     # a camera actually being declared PTZ-capable in CAMERAS_FILE. Today's
     # fleet declares none, so this is always empty regardless of any user's
     # `ptz:` grant -- the feature is inert until real hardware exists.
     controllable_cameras = ptz_cameras & ptz_capable_cameras()
+    # Same two-gate rule for the speaker: granted AND declared `talk: true`.
+    speakable_cameras = talk_cameras & talk_capable_cameras()
 
     idle_prompt, heartbeat_timeout = idle_settings()
     token = secrets.token_urlsafe(24)
@@ -1311,6 +1718,7 @@ def dashboard():
         cameras=[{"name": c, "label": display_name(c)} for c in sorted(allowed_cameras)],
         audio_cameras=sorted(audio_cameras),
         ptz_cameras=sorted(controllable_cameras),
+        talk_cameras=sorted(speakable_cameras),
         token=token,
         idle_prompt_seconds=idle_prompt,
         egress_bytes=used,
