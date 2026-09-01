@@ -923,9 +923,12 @@ function sbSay(msg, isError) {
   sbStatusEl.style.background = isError ? '#4a2f2f' : '#3a2f19';
 }
 
-function fmtBytes(n) {
-  return n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.round(n / 1e3)} KB`;
-}
+// Clip sizes are rendered with the existing fmtBytes() defined further down
+// for the usage meter -- it is declared `const` at the same top level, so a
+// second definition here is a redeclaration SyntaxError that stops the whole
+// script parsing (which took the entire dashboard down once: no tiles, no
+// click handlers, no usage counter). It is only called from click handlers,
+// long after parse, so referring to it before its declaration is fine.
 
 async function sbLoadClips() {
   sbListEl.innerHTML = '';

@@ -996,6 +996,44 @@ def main():
     check("the throttle holds even for the correct password",
           b"Too many attempts" in r.data)
 
+    # --- the dashboard's inline JS actually parses ---
+    # This whole app's front end is one inline <script> with no build step and
+    # no JS tooling, so nothing else in this suite can see a JavaScript error.
+    # That is not theoretical: shipping a `function fmtBytes()` alongside the
+    # existing `const fmtBytes` was a redeclaration SyntaxError, which stops
+    # the *entire* script parsing -- the dashboard rendered 200 with no tiles,
+    # dead click handlers and a frozen usage counter, because none of the
+    # code after it ever ran. These are cheap static checks for exactly the
+    # mistakes that kill the script wholesale.
+    dash = admin_c.get("/", headers={"Host": LAN}).get_data(as_text=True)
+    inline = re.search(r"<script>(.*)</script>", dash, re.S)
+    check("dashboard ships an inline script", inline is not None)
+    if inline:
+        js = inline.group(1)
+        # Column-0 declarations only: anything indented is inside a function
+        # and may legitimately reuse a name.
+        top_vars = re.findall(r"^(?:const|let|var)\s+([A-Za-z_$][\w$]*)", js, re.M)
+        top_funcs = re.findall(r"^function\s+([A-Za-z_$][\w$]*)", js, re.M)
+        collisions = sorted(set(top_vars) & set(top_funcs))
+        check("no name is declared as both a top-level function and a const/let/var",
+              not collisions, collisions)
+        repeats = sorted({n for n in top_vars if top_vars.count(n) > 1}
+                         | {n for n in top_funcs if top_funcs.count(n) > 1})
+        check("no top-level JS declaration is repeated", not repeats, repeats)
+        for open_ch, close_ch in (("{", "}"), ("(", ")"), ("[", "]")):
+            check(f"inline JS {open_ch}{close_ch} are balanced",
+                  js.count(open_ch) == js.count(close_ch),
+                  (js.count(open_ch), js.count(close_ch)))
+        # Every element the script grabs must exist somewhere in the markup.
+        # Checked against the TEMPLATE, not this rendered page: several
+        # elements (the home banner, the LAN switch) only appear on one
+        # hostname, and the template holds every branch.
+        with open(os.path.join(REPO, "templates", "index.html")) as f:
+            template_src = f.read()
+        for el in sorted(set(re.findall(r"getElementById\('([^']+)'\)", js))):
+            check(f"element #{el} referenced by the script exists in the markup",
+                  f'id="{el}"' in template_src, el)
+
     print()
     print("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures))
     return 1 if failures else 0
