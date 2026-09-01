@@ -66,7 +66,10 @@
   #sbPreview { width:100%; margin-top:.5rem; }
   #sbRecBtn.on { background:#c0392b; }
   #sbList { list-style:none; margin:.4rem 0; padding:0; max-height:12rem; overflow-y:auto; }
-  #sbList li { display:flex; align-items:center; gap:.5rem; padding:.25rem 0; font-size:.85rem; }
+  #sbList li { display:flex; align-items:center; gap:.5rem; padding:.25rem 0; font-size:.85rem;
+               flex-wrap:wrap; }
+  #sbList .sbCam { background:#3a2f19; }
+  #sbClipPreview { width:100%; margin-top:.4rem; }
   #sbList li span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #sbList button { padding:.25rem .6rem; font-size:.75rem; }
   #sbList .sbDel { background:#4a2f2f; }
@@ -265,7 +268,7 @@
       <audio id="sbPreview" controls></audio>
       <div class="sbReviewBtns">
         <button id="sbSend" type="button">Send once</button>
-        <button id="sbSave" type="button">Save to soundboard</button>
+        <button id="sbSave" type="button">Save to soundboard (no sound)</button>
         <button id="sbDiscard" type="button">Discard</button>
       </div>
     </div>
@@ -274,6 +277,9 @@
   <div class="sbClips">
     <strong class="sbNote">Saved clips</strong>
     <ul id="sbList"></ul>
+    <!-- Local audition only: this plays in the browser and never touches the
+         camera's speaker, so a clip can be checked without waking anyone. -->
+    <audio id="sbClipPreview" controls hidden></audio>
     <label class="sbUpload">
       Upload a clip
       <input id="sbFile" type="file" accept="audio/*" hidden>
@@ -913,6 +919,7 @@ const sbRecState = document.getElementById('sbRecState');
 const sbReview = document.getElementById('sbReview');
 const sbPreview = document.getElementById('sbPreview');
 const sbFile = document.getElementById('sbFile');
+const sbClipPreview = document.getElementById('sbClipPreview');
 
 let recorder = null, recChunks = [], recBlob = null;
 
@@ -944,10 +951,22 @@ async function sbLoadClips() {
       const li = document.createElement('li');
       const name = document.createElement('span');
       name.textContent = `${c.label} (${fmtBytes(c.bytes)})`;
+      // "Listen" is the browser; "Camera" is the room. They are labelled
+      // as two different destinations on purpose -- a single "Play" button
+      // makes it far too easy to broadcast into a room by accident.
+      const listen = document.createElement('button');
+      listen.type = 'button';
+      listen.textContent = 'Listen';
+      listen.addEventListener('click', () => sbListen(c.id, c.label));
       const play = document.createElement('button');
       play.type = 'button';
-      play.textContent = '▶ Play';
+      play.className = 'sbCam';
+      play.textContent = '▶ Camera';
       play.addEventListener('click', () => sbPlay(c.id));
+      const ren = document.createElement('button');
+      ren.type = 'button';
+      ren.textContent = 'Rename';
+      ren.addEventListener('click', () => sbRename(c.id, c.label));
       const del = document.createElement('button');
       del.type = 'button';
       del.className = 'sbDel';
@@ -957,10 +976,35 @@ async function sbLoadClips() {
       del.addEventListener('click', () => {
         if (confirm(`Delete "${c.label}"? This cannot be undone.`)) sbDelete(c.id);
       });
-      li.append(name, play, del);
+      li.append(name, listen, play, ren, del);
       sbListEl.appendChild(li);
     });
   } catch (e) { sbSay('Could not load clips.', true); }
+}
+
+function sbListen(clipId, label) {
+  // Plays through the phone/laptop only. Nothing is sent to the camera.
+  sbClipPreview.hidden = false;
+  sbClipPreview.src = `/soundboard/preview/${encodeURIComponent(clipId)}`;
+  sbClipPreview.play().catch(() => {});
+  sbSay(`Previewing "${label}" here only \u2014 nothing sent to the camera.`);
+}
+
+async function sbRename(clipId, label) {
+  const next = prompt('New name for this clip:', label);
+  if (next === null) return;
+  if (!next.trim()) { sbSay('A name is required.', true); return; }
+  try {
+    const r = await fetch(`/soundboard/${encodeURIComponent(clipId)}/rename`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: next }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) { sbSay(data.error || `Rename failed (${r.status}).`, true); return; }
+    sbSay('Renamed.');
+    sbLoadClips();
+  } catch (e) { sbSay('Network error.', true); }
 }
 
 async function sbPlay(clipId) {
@@ -1030,32 +1074,56 @@ sbRecBtn.addEventListener('click', async () => {
   }
 });
 
-async function sbUploadRecording(save) {
+// The extension has to match what MediaRecorder actually produced, since
+// the server validates on it -- Chrome gives webm, Safari mp4/m4a.
+function sbRecExt() {
+  const type = (recBlob && recBlob.type) || '';
+  return type.includes('mp4') || type.includes('m4a') ? '.m4a'
+       : type.includes('ogg') ? '.ogg' : '.webm';
+}
+
+async function sbSendRecording() {
   if (!recBlob || !current) return;
-  // The extension has to match what MediaRecorder actually produced, since
-  // the server validates on it -- Chrome gives webm, Safari mp4/m4a.
-  const type = recBlob.type || '';
-  const ext = type.includes('mp4') || type.includes('m4a') ? '.m4a'
-            : type.includes('ogg') ? '.ogg' : '.webm';
   const form = new FormData();
-  form.append('clip', recBlob, `recording${ext}`);
-  if (save) form.append('save', '1');
-  sbSay(save ? 'Saving and playing…' : 'Sending…');
+  form.append('clip', recBlob, `recording${sbRecExt()}`);
+  sbSay('Sending…');
   try {
     const r = await fetch(`/talk/${encodeURIComponent(current)}/say`, {
       method: 'POST', body: form,
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) { sbSay(data.error || `Failed (${r.status}).`, true); return; }
-    sbSay(save ? 'Sent and saved to the soundboard.' : 'Sent.');
+    sbSay('Sent.');
     sbReview.hidden = true;
     recBlob = null;
-    if (save) sbLoadClips();
   } catch (e) { sbSay('Network error.', true); }
 }
 
-document.getElementById('sbSend').addEventListener('click', () => sbUploadRecording(false));
-document.getElementById('sbSave').addEventListener('click', () => sbUploadRecording(true));
+// Saving deliberately does NOT play. They are separate intentions, and
+// combining them makes it impossible to build up the board while the room
+// the camera is in has to stay quiet.
+async function sbSaveRecording() {
+  if (!recBlob) return;
+  const name = prompt('Name for this clip:', '');
+  if (name === null) return;
+  if (!name.trim()) { sbSay('A name is required.', true); return; }
+  const form = new FormData();
+  form.append('clip', recBlob, `recording${sbRecExt()}`);
+  form.append('label', name);
+  sbSay('Saving…');
+  try {
+    const r = await fetch('/soundboard/save', { method: 'POST', body: form });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) { sbSay(data.error || `Save failed (${r.status}).`, true); return; }
+    sbSay('Saved. Nothing was played on the camera.');
+    sbReview.hidden = true;
+    recBlob = null;
+    sbLoadClips();
+  } catch (e) { sbSay('Network error.', true); }
+}
+
+document.getElementById('sbSend').addEventListener('click', sbSendRecording);
+document.getElementById('sbSave').addEventListener('click', sbSaveRecording);
 document.getElementById('sbDiscard').addEventListener('click', () => {
   sbReview.hidden = true;
   recBlob = null;

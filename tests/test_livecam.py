@@ -899,6 +899,63 @@ def main():
           "Nice_Clip.wav" in [c["id"] for c in livecam.soundboard_clips()],
           livecam.soundboard_clips())
 
+    # --- rename, browser preview, and save-without-playing ---
+    r = admin_c.post("/soundboard/Nice_Clip.wav/rename", headers={"Host": LAN},
+                     json={"label": "Hamster Taunt"})
+    ids = [c["id"] for c in livecam.soundboard_clips()]
+    check("rename gives the clip its new name",
+          r.status_code == 200 and "Hamster_Taunt.wav" in ids, ids)
+    check("rename keeps the original extension, not one from the label",
+          all(i.endswith(".wav") for i in ids), ids)
+
+    r = admin_c.post("/soundboard/Hamster_Taunt.wav/rename", headers={"Host": LAN},
+                     json={"label": "evil.sh"})
+    ids = [c["id"] for c in livecam.soundboard_clips()]
+    check("a label with a foreign extension cannot change the stored type",
+          r.status_code == 200 and "evil.wav" in ids
+          and not any(i.endswith(".sh") for i in ids), ids)
+    livecam._rename_clip("evil.wav", "Hamster Taunt")
+
+    r = admin_c.post("/soundboard/Hamster_Taunt.wav/rename", headers={"Host": LAN},
+                     json={"label": "   "})
+    check("rename refuses an empty name", r.status_code == 400, r.status_code)
+    r = admin_c.post("/soundboard/nope.wav/rename", headers={"Host": LAN},
+                     json={"label": "x"})
+    check("rename of a missing clip is a 404", r.status_code == 404, r.status_code)
+    r = part.post("/soundboard/Hamster_Taunt.wav/rename", headers={"Host": LAN},
+                  json={"label": "x"})
+    check("rename needs the elevated grant", r.status_code == 403, r.status_code)
+
+    # Preview is the browser path: session-gated, and a real audio type so an
+    # <audio> element will play it. Distinct from the token-gated go2rtc path.
+    r = admin_c.get("/soundboard/preview/Hamster_Taunt.wav", headers={"Host": LAN})
+    check("preview serves the clip to a logged-in browser",
+          r.status_code == 200, r.status_code)
+    check("preview sends a real audio content type",
+          "audio/" in r.headers.get("Content-Type", ""), r.headers.get("Content-Type"))
+    anon = app.test_client()
+    r = anon.get("/soundboard/preview/Hamster_Taunt.wav", headers={"Host": LAN})
+    check("preview is not open to anonymous callers",
+          r.status_code in (302, 401, 403), r.status_code)
+    r = admin_c.get("/soundboard/preview/../../etc/passwd", headers={"Host": LAN})
+    check("preview refuses a traversing id", r.status_code in (400, 404), r.status_code)
+
+    # Saving a recording must NOT play it -- that is the whole point of the
+    # endpoint existing separately from /talk/<camera>/say.
+    r = admin_c.post("/soundboard/save", headers={"Host": LAN},
+                     data={"clip": (io.BytesIO(b"RIFFrec"), "recording.webm"),
+                           "label": "My Voice"},
+                     content_type="multipart/form-data")
+    ids = [c["id"] for c in livecam.soundboard_clips()]
+    check("a recording can be saved under a chosen name",
+          r.status_code == 201 and "My_Voice.webm" in ids, ids)
+    r = part.post("/soundboard/save", headers={"Host": LAN},
+                  data={"clip": (io.BytesIO(b"RIFFrec"), "recording.webm")},
+                  content_type="multipart/form-data")
+    check("saving a recording needs the elevated grant", r.status_code == 403, r.status_code)
+    admin_c.delete("/soundboard/My_Voice.webm", headers={"Host": LAN})
+    livecam._rename_clip("Hamster_Taunt.wav", "Nice Clip")
+
     r = admin_c.delete("/soundboard/Nice_Clip.wav", headers={"Host": LAN})
     check("delete removes only the targeted clip",
           r.status_code == 200

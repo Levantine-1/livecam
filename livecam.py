@@ -47,7 +47,7 @@ from functools import wraps
 import requests
 import yaml
 from flask import (Flask, Response, abort, jsonify, redirect, render_template,
-                   request, session, stream_with_context, url_for)
+                   request, send_file, session, stream_with_context, url_for)
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from onvif import ONVIFCamera
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -98,6 +98,14 @@ SOUNDBOARD_MAX_BYTES = int(os.environ.get("SOUNDBOARD_MAX_BYTES", str(5 * 1024 *
 # ffmpeg does the decode, so this list is about refusing obvious junk rather
 # than about what can be played.
 SOUNDBOARD_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus", ".aac", ".webm", ".flac"}
+# Content types for in-browser preview. The go2rtc handoff deliberately does
+# NOT use these -- ffmpeg probes the bytes itself -- but an <audio> element
+# needs a real type before it will admit it can play a clip at all.
+SOUNDBOARD_MIME = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".aac": "audio/aac", ".ogg": "audio/ogg", ".oga": "audio/ogg",
+    ".opus": "audio/ogg", ".webm": "audio/webm", ".flac": "audio/flac",
+}
 
 # go2rtc fetches clips over HTTP by URL, because it runs on the Frigate VM and
 # cannot see this container's filesystem. It therefore needs an address that
@@ -1437,6 +1445,35 @@ def _store_clip(file_storage, label=None):
     return name
 
 
+def _rename_clip(clip_id, label):
+    """Rename a stored clip, keeping its extension. Returns the new id.
+
+    The extension comes from the existing file, never from the new label: the
+    label is a display name, and letting it set the extension would let a
+    rename mislabel a clip's actual format (and, since _clip_path gates on the
+    extension, rename a clip out of existence).
+    """
+    old = _clip_path(clip_id)
+    if not old or not os.path.isfile(old):
+        raise LookupError(clip_id)
+
+    raw = str(label or "").strip()
+    # Only strip a trailing extension if it is genuinely an audio one --
+    # blanket splitext would turn a name like "take 2.1" into "take 2".
+    base, trailing = os.path.splitext(raw)
+    if trailing.lower() in SOUNDBOARD_EXTENSIONS:
+        raw = base
+    if not re.sub(r"[^A-Za-z0-9 _-]+", "", raw).strip():
+        raise ValueError("a name is required")
+
+    ext = os.path.splitext(clip_id)[1].lower()
+    new_id = _safe_clip_name(raw, ext)
+    if new_id == clip_id:
+        return clip_id
+    os.rename(old, os.path.join(SOUNDBOARD_DIR, new_id))
+    return new_id
+
+
 def backchannel_stream(camera, streams):
     """Which go2rtc stream currently carries this camera's speaker, or None.
 
@@ -1613,6 +1650,74 @@ def soundboard_delete(clip_id):
     return jsonify({"clips": soundboard_clips()})
 
 
+@app.route("/soundboard/<clip_id>/rename", methods=["POST"])
+@login_required
+def soundboard_rename(clip_id):
+    permissions = load_permissions()
+    if not (user_entries(permissions).get(current_user()) or {}).get("recordings"):
+        abort(403)
+
+    label = (request.get_json(silent=True) or {}).get("label")
+    try:
+        new_id = _rename_clip(clip_id, label)
+    except LookupError:
+        abort(404)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except OSError:
+        log.exception("could not rename clip %s", clip_id)
+        abort(500)
+    log.info("soundboard clip renamed %s -> %s user=%s", clip_id, new_id, current_user())
+    return jsonify({"clip": new_id, "clips": soundboard_clips()})
+
+
+@app.route("/soundboard/save", methods=["POST"])
+@login_required
+def soundboard_save():
+    """Store a recording as a permanent clip WITHOUT playing it.
+
+    Deliberately separate from /talk/<camera>/say, which plays and only
+    optionally keeps. Saving and making noise are different intentions, and
+    tying them together makes it impossible to build up the board while the
+    room the camera sits in has to stay quiet.
+    """
+    permissions = load_permissions()
+    if not (user_entries(permissions).get(current_user()) or {}).get("recordings"):
+        abort(403)
+
+    upload = request.files.get("clip")
+    if upload is None or not upload.filename:
+        abort(400)
+    try:
+        clip_id = _store_clip(upload, request.form.get("label"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except OSError:
+        log.exception("could not save recorded clip")
+        abort(500)
+    log.info("soundboard clip saved from recording id=%s user=%s", clip_id, current_user())
+    return jsonify({"clip": clip_id, "clips": soundboard_clips()}), 201
+
+
+@app.route("/soundboard/preview/<clip_id>")
+@login_required
+def soundboard_preview(clip_id):
+    """Serve a clip to the BROWSER so it can be auditioned locally.
+
+    Separate from /soundboard/raw/<token>, which exists for go2rtc and is
+    authorised by a signed token because it arrives with no session. This one
+    is session-gated and sends a real audio content type so an <audio> element
+    will play it -- letting a clip be heard on the phone before it is pushed
+    into a room where someone may be asleep.
+    """
+    path = _clip_path(clip_id)
+    if not path or not os.path.isfile(path):
+        abort(404)
+    ext = os.path.splitext(clip_id)[1].lower()
+    return send_file(path, mimetype=SOUNDBOARD_MIME.get(ext, "application/octet-stream"),
+                     conditional=True)
+
+
 @app.route("/soundboard/raw/<token>")
 def soundboard_raw(token):
     """Serve a clip's bytes to go2rtc.
@@ -1672,12 +1777,14 @@ def talk_say(camera):
     upload = request.files.get("clip")
     if upload is None or not upload.filename:
         abort(400)
+    # A kept recording gets the name the user typed; a send-once recording
+    # gets a timestamp, since it is deleted moments later anyway.
+    keep = request.form.get("save") == "1"
+    label = request.form.get("label")
     try:
-        clip_id = _store_clip(upload, f"say_{int(time.time())}")
+        clip_id = _store_clip(upload, label if (keep and label) else f"say_{int(time.time())}")
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-
-    keep = request.form.get("save") == "1"
     try:
         _play_clip(camera, clip_id)
     except RuntimeError as e:
