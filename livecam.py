@@ -1066,12 +1066,26 @@ def live(camera):
     # which don't track this. See _record_stream_bytes()'s own comment.
     conn_id = _sanitize_conn_id(request.args.get("conn"))
 
-    upstream = requests.get(
-        f"{GO2RTC_URL}/api/stream.mp4",
-        params={"src": stream},
-        stream=True,
-        timeout=15,
-    )
+    # stream_id, if set, was already added to _full_streams above to reserve
+    # a slot before this connects -- a slot reserved for a connection that
+    # never happens must be released here, not just inside pump()'s finally,
+    # which never runs if this raises. The HLS path below (~line 905) avoids
+    # this class of bug entirely by recomputing its active count from a
+    # time-windowed, self-expiring dict instead of a manually-discarded set;
+    # this path predates that pattern and a leaked slot here only clears on
+    # container restart.
+    try:
+        upstream = requests.get(
+            f"{GO2RTC_URL}/api/stream.mp4",
+            params={"src": stream},
+            stream=True,
+            timeout=15,
+        )
+    except Exception:
+        if stream_id is not None:
+            with _sessions_lock:
+                _full_streams.discard(stream_id)
+        raise
 
     log.info("live start camera=%s stream=%s quality=%s user=%s metered=%s",
              camera, stream, quality, username, metered)

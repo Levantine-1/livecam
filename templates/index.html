@@ -547,6 +547,11 @@ function stopTiles() { tiles.forEach(stopVideo); }
 let current = null;          // camera name
 let soundOn = false;         // has the viewer asked for audio this session
 let currentQuality = 'full';
+// True only when 'sub' was landed on by the stall watcher below, never when
+// the viewer picked it deliberately via the quality button -- distinguishes
+// "try climbing back to full once things look healthy" from "leave it alone,
+// they chose this".
+let autoDowngraded = false;
 
 // --- live data rate / session total ---------------------------------------
 // No per-stream byte counter exists server-side otherwise -- conn is a
@@ -593,6 +598,7 @@ function watchUsage(connId) {
 }
 
 function loadOverlay(cam, quality, audio) {
+  if (overlayVideo._abandonStream) { overlayVideo._abandonStream(); overlayVideo._abandonStream = null; }
   currentQuality = quality;
   const onMain = quality === 'full';
   if (qualityMainBtn) {
@@ -641,6 +647,7 @@ function expand(cam) {
   if (talkBtn) talkBtn.hidden = !TALK_CAMERAS.has(cam);
   overlay.hidden = false;
   say('');
+  autoDowngraded = false;
   // Muted and audio-free by default. Sound is a separate, explicit act --
   // see the sound button below.
   loadOverlay(cam, 'full', soundOn);
@@ -662,11 +669,15 @@ function expand(cam) {
 // for as long as the overlay stays open and the camera stays unreachable.
 const STALL_DOWNGRADE_S = 8;
 const STALL_RECONNECT_S = 20;
+// How long 'sub' has to run stall-free before trying 'full' again. Well
+// clear of STALL_DOWNGRADE_S so a genuinely marginal link settles at 'sub'
+// instead of bouncing between the two every half-minute.
+const AUTO_UPGRADE_STABLE_S = 30;
 
 let stallTimer = null;
 function watchForStall() {
   clearInterval(stallTimer);
-  let last = -1, stuck = 0;
+  let last = -1, stuck = 0, healthy = 0;
   stallTimer = setInterval(() => {
     if (overlay.hidden || overlayVideo.paused) return;
     const t = overlayVideo.currentTime;
@@ -675,6 +686,7 @@ function watchForStall() {
     last = t;
     if (stuck >= STALL_DOWNGRADE_S && currentQuality === 'full') {
       clearInterval(stallTimer);
+      autoDowngraded = true;
       say('Full quality was not keeping up here, so this dropped to the lower-resolution stream.');
       loadOverlay(current, 'sub', false);
     } else if (stuck >= STALL_RECONNECT_S) {
@@ -685,9 +697,18 @@ function watchForStall() {
       // Live from the first missed second, not just at the thresholds above
       // -- so a stall reads as "still stuck" the whole time it lasts,
       // rather than silence until one of those two actions fires.
+      healthy = 0;
       say(`No new video for ${stuck}s…`);
-    } else if (wasStuck) {
-      say('');
+    } else {
+      healthy++;
+      if (autoDowngraded && currentQuality === 'sub' && healthy >= AUTO_UPGRADE_STABLE_S) {
+        clearInterval(stallTimer);
+        autoDowngraded = false;
+        say('Trying full quality again…');
+        loadOverlay(current, 'full', soundOn);
+      } else if (wasStuck) {
+        say('');
+      }
     }
   }, 1000);
 }
@@ -721,11 +742,13 @@ function collapse() {
 // worse than just picking the secondary stream up front.
 if (qualityMainBtn) {
   qualityMainBtn.addEventListener('click', () => {
+    autoDowngraded = false;
     if (current && currentQuality !== 'full') loadOverlay(current, 'full', soundOn);
   });
 }
 if (qualitySecondaryBtn) {
   qualitySecondaryBtn.addEventListener('click', () => {
+    autoDowngraded = false;
     if (current && currentQuality !== 'sub') loadOverlay(current, 'sub', soundOn);
   });
 }

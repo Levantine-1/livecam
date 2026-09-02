@@ -354,6 +354,27 @@ def main():
     check("audio is never added to a substream",
           livecam.resolve_stream_name("cam", True, "sub", want_audio=True) == "cam_sub_noaudio")
 
+    # A full-quality request reserves its _full_streams slot BEFORE
+    # connecting upstream (livecam.py ~1054-1061), and used to release it
+    # only inside pump()'s finally -- which never runs if that connection
+    # attempt itself raises. A camera whose producer is mid-reconnect is
+    # exactly when this fires for real (2026-09-02: a soundboard play
+    # visibly disrupted baby-ptz's own RTSP producer for about two minutes,
+    # and any full-quality request landing in that window would have leaked
+    # a slot permanently, until the next container restart).
+    check("_full_streams starts empty for this check", not livecam._full_streams, livecam._full_streams)
+    real_get = livecam.requests.get
+    livecam.requests.get = lambda *a, **kw: (_ for _ in ()).throw(
+        livecam.requests.exceptions.ConnectionError("upstream refused"))
+    try:
+        r = c.get(f"/live/the-boiz?token={token}&quality=full", headers={"Host": PUB})
+        check("a failed upstream connection surfaces as a server error, not a hang",
+              r.status_code == 500, r.status_code)
+    finally:
+        livecam.requests.get = real_get
+    check("a failed upstream connection does not leak a full-quality slot",
+          not livecam._full_streams, livecam._full_streams)
+
     r = c.get(f"/live/guinea-pig-cage-9?token={token}", headers={"Host": PUB})
     check("a camera not on the user's list is refused", r.status_code == 403, r.status_code)
 
@@ -1136,6 +1157,34 @@ def main():
         for el in sorted(set(re.findall(r"getElementById\('([^']+)'\)", js))):
             check(f"element #{el} referenced by the script exists in the markup",
                   f'id="{el}"' in template_src, el)
+
+        # --- overlay reconnect hygiene (2026-09-02) ---
+        # stopVideo() (used for grid tiles) always abandons a video
+        # element's in-flight attempt before reassigning its source; the
+        # overlay's own stall-triggered reconnect path called loadOverlay()
+        # again without it, leaving a previous attempt's pending timer and
+        # 'playing'/'error' listeners attached through however many
+        # reconnects followed during a real multi-minute disruption. Checked
+        # structurally against the source rather than by driving a real
+        # <video> element, which this suite has no browser to do.
+        check("loadOverlay abandons any attempt already in flight before starting a new one",
+              "_abandonStream" in js[js.index("function loadOverlay("):js.index("function expand(")])
+        # Once a stall forces 'sub', nothing tried 'full' again until the
+        # viewer noticed and intervened -- a real but temporary disruption
+        # (a camera-side hiccup, a network blip) left the view permanently
+        # degraded rather than recovering on its own the way reopening the
+        # camera would have.
+        check("a stall-forced downgrade is tracked so recovery can try climbing back",
+              "autoDowngraded = true" in js)
+        check("a sustained healthy period after an auto-downgrade retries full quality",
+              "AUTO_UPGRADE_STABLE_S" in js and "loadOverlay(current, 'full'" in js)
+        # A quality button the viewer clicks themselves must not be treated
+        # as something to second-guess later.
+        for handler_name in ("qualityMainBtn", "qualitySecondaryBtn"):
+            start = js.index(f"if ({handler_name}) {{")
+            handler_body = js[start:js.index("});", start)]
+            check(f"clicking {handler_name} clears the auto-downgrade flag",
+                  "autoDowngraded = false" in handler_body)
 
     print()
     print("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures))
