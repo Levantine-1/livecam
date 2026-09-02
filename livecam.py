@@ -1295,6 +1295,42 @@ async def _set_speaker_volume(camera, level):
     The whole configuration object is round-tripped rather than sending
     OutputLevel alone: SetAudioOutputConfiguration *replaces* the
     configuration, so omitting fields (SendPrimacy, token) would blank them.
+
+    UNRESOLVED as of 2026-09-02: OutputLevel is NOT confirmed to be the
+    control that actually gates the physical speaker on this camera. A
+    soundboard clip and a plain sine tone were both played at OutputLevel 10
+    and again at 50 (the value confirmed audible in an earlier session) --
+    silent both times, at both levels. Everything else checked out clean:
+    go2rtc's stream showed the backchannel sender correctly attached
+    (codec pcm_alaw) with no error, the pushed audio's signal level was
+    healthy pre- and post-transcode (confirmed locally with ffmpeg's
+    volumedetect, ruling out "silent/corrupted audio content"), and neither
+    Frigate's recording (watchdog restart count) nor the camera's own video
+    producer were disrupted by any of these plays -- so this is NOT the
+    "pushing audio disrupts the video pipeline" failure mode investigated
+    earlier the same night (see backchannel_stream()'s docstring for that
+    unrelated, and apparently non-reproducible, incident).
+
+    The live lead: the camera's full config dump (getConfig&name=All) shows
+    a SECOND, independent volume parameter this code has never touched --
+    `AudioOutputVolume[0]`, native to the camera's own HTTP API, distinct
+    from `OnvifMedia.AudioOutputConfigs.00000.OutputLevel` (the ONVIF field
+    this function writes). Observed at 100 (max) while ONVIF OutputLevel was
+    also at 50 and audio was still inaudible -- so either that native
+    parameter ALSO doesn't gate the real speaker, or something downstream of
+    both volume controls is broken. Also unexamined: the camera's Talkback
+    config (getConfig&name=Talkback) declares `Pack=DHAV`, Dahua's own
+    proprietary audio packetization -- go2rtc delivers plain RTP/AVP PCMA
+    per the negotiated SDP, and it is not established whether the camera's
+    Talkback decoder silently drops correctly-formed RTP that isn't wrapped
+    in DHAV framing.
+
+    Next diagnostic step planned but not yet done: drive the camera's own
+    native talkback (its own app or web UI, not go2rtc) to check whether the
+    speaker produces sound AT ALL through the vendor's intended path. That
+    separates "our RTP delivery doesn't match what this camera expects" from
+    "the speaker/wiring itself is at fault" without needing another test
+    play through this code.
     """
     client = await _get_ptz_client(camera)
     cfg = await _audio_output_config(camera)
@@ -1501,6 +1537,18 @@ def backchannel_stream(camera, streams):
 
     So the holder is discovered per play. The tell is a producer media
     marked sendonly with the PCMA (G.711 A-law) codec the backchannel uses.
+
+    2026-09-02 postscript: a single soundboard play was ONCE followed by
+    ~2 minutes of Frigate watchdog restarts and a dropped live-view session
+    on this camera specifically, timed almost exactly to the play. A later,
+    deliberate two-play back-to-back test (plus a follow-up third play)
+    reproduced NONE of that -- clean producer, no watchdog restart, on every
+    attempt. Whatever caused that one incident does not appear to be an
+    inherent, repeatable cost of using this function; treat it as unexplained
+    rather than as a known recurring risk. Separately and NOT explained by
+    that incident: none of those later test plays were actually audible, at
+    two different volumes -- see _set_speaker_volume()'s docstring for that
+    still-open thread.
     """
     for name, info in (streams or {}).items():
         if name != camera and not name.startswith(f"{camera}_"):
