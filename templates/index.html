@@ -203,9 +203,9 @@
            media, without which the element silently refuses to start. -->
       <button id="soundBtn" type="button" aria-pressed="false" hidden>&#128263; Sound off</button>
       <span id="gainWrap" hidden>
-        <label for="gain">boost</label>
-        <input id="gain" type="range" min="100" max="400" step="10" value="200">
-        <span id="gainVal">200%</span>
+        <label for="gain">volume</label>
+        <input id="gain" type="range" min="0" max="400" step="10" value="100">
+        <span id="gainVal">100%</span>
       </span>
       <span class="badge" id="noAudioBadge" hidden>no audio</span>
       <button id="closeBtn" type="button">Close (Esc)</button>
@@ -788,6 +788,11 @@ if (soundBtn) {
     ctx.createMediaElementSource(overlayVideo).connect(gainNode).connect(ctx.destination);
     applyGain();
   }
+  // Slider spans 0-400%, not just the 100-400% boost range problem #2 above
+  // needs -- GainNode supports gain < 1 as attenuation for free, so the same
+  // control also covers "too loud", not just "too quiet". Default is 100
+  // (unity: play the stream as encoded) rather than an already-boosted
+  // value, since boosting should be an explicit choice per camera/session.
   function applyGain() {
     if (gainNode) gainNode.gain.value = Number(gainInput.value) / 100;
     gainVal.textContent = gainInput.value + '%';
