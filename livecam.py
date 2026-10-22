@@ -41,7 +41,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from functools import wraps
 
 import requests
@@ -69,6 +69,18 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "").lower()
     in ("1", "true", "yes"),
+)
+
+# A login is remembered on the device for this long. It was a browser-session
+# cookie, which phones in particular discard whenever they like, so people
+# were logging in again several times a day. The window counts from the
+# login itself, not from the last request -- daily use does not quietly turn
+# it into a login that never expires. current_user() enforces the same cap
+# server-side, so it holds even against a cookie whose own expiry is ignored.
+SESSION_LIFETIME_HOURS = float(os.environ.get("SESSION_LIFETIME_HOURS", "24"))
+app.config.update(
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=SESSION_LIFETIME_HOURS),
+    SESSION_REFRESH_EACH_REQUEST=False,
 )
 
 FRIGATE_URL = os.environ["FRIGATE_URL"].rstrip("/")
@@ -332,6 +344,153 @@ def egress_this_month():
         return stored + _egress_pending
 
 
+# --------------------------------------------------------------------------
+# Viewing audit log
+#
+# One row per dashboard load (one live token): who, from which device and
+# address, over which route, how long they actually watched and how much
+# video it moved. "Watched" counts only heartbeat intervals during which the
+# browser reported a playing, visible video -- a page left open in a
+# background tab or behind the idle dialog is not viewing, and counting it
+# would make the number useless for the question it answers.
+#
+# Same storage pattern as the egress counter: SQLite on the writable volume,
+# bytes accumulated in memory and written on each heartbeat rather than per
+# chunk.
+# --------------------------------------------------------------------------
+AUDIT_DB = os.environ.get("AUDIT_DB", "/app/data/audit.db")
+AUDIT_RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "90"))
+AUDIT_PAGE_DAYS = 30
+# The browser beats every 60s. A longer gap means the page was asleep in
+# between, so one beat never credits more than this much viewing.
+AUDIT_MAX_BEAT_GAP_SECONDS = 90
+
+_audit_lock = threading.Lock()
+_audit_bytes = {}  # live token -> bytes not yet written
+
+
+def _audit_conn():
+    directory = os.path.dirname(AUDIT_DB)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    conn = sqlite3.connect(AUDIT_DB, timeout=10)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS views ("
+        " token TEXT PRIMARY KEY, user TEXT NOT NULL, ip TEXT, device TEXT,"
+        " route TEXT, started_at REAL NOT NULL, last_seen REAL NOT NULL,"
+        " watched_seconds REAL NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0)"
+    )
+    return conn
+
+
+def describe_user_agent(ua):
+    """A human label like "Chrome on Windows" from a User-Agent string.
+
+    Order matters: nearly every browser's UA also claims to be Safari, and
+    Chromium-based ones also claim Chrome, so the specific tokens are tried
+    before the generic ones.
+    """
+    ua = ua or ""
+    if "iPhone" in ua:
+        platform = "iPhone"
+    elif "iPad" in ua:
+        platform = "iPad"
+    elif "Android" in ua:
+        platform = "Android"
+    elif "Windows" in ua:
+        platform = "Windows"
+    elif "Macintosh" in ua or "Mac OS X" in ua:
+        platform = "Mac"
+    elif "CrOS" in ua:
+        platform = "ChromeOS"
+    elif "Linux" in ua:
+        platform = "Linux"
+    else:
+        platform = None
+
+    for token, name in (("Edg", "Edge"), ("OPR/", "Opera"),
+                        ("SamsungBrowser", "Samsung Internet"), ("CriOS", "Chrome"),
+                        ("FxiOS", "Firefox"), ("Firefox/", "Firefox"),
+                        ("Chrome/", "Chrome"), ("Safari/", "Safari")):
+        if token in ua:
+            browser = name
+            break
+    else:
+        browser = None
+
+    if browser and platform:
+        return f"{browser} on {platform}"
+    return browser or platform or "Unknown device"
+
+
+def audit_start(token, username):
+    """Open the audit row for a freshly minted live token."""
+    now = time.time()
+    try:
+        conn = _audit_conn()
+        with conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO views (token, user, ip, device, route, started_at, last_seen)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (token, username, _client_ip(),
+                 describe_user_agent(request.headers.get("User-Agent")),
+                 "WAN" if is_public_request() else "LAN", now, now),
+            )
+            conn.execute("DELETE FROM views WHERE last_seen < ?",
+                         (now - AUDIT_RETENTION_DAYS * 86400,))
+        conn.close()
+    except Exception:
+        # The audit log is a record, not a gate: failing to write it must
+        # never stop someone watching.
+        log.exception("audit start failed")
+
+
+def audit_bytes(token, count):
+    if not token:
+        return
+    with _audit_lock:
+        _audit_bytes[token] = _audit_bytes.get(token, 0) + count
+
+
+def audit_flush(token, watched=0.0):
+    """Write a token's pending bytes and any newly watched seconds."""
+    with _audit_lock:
+        pending = _audit_bytes.pop(token, 0)
+    try:
+        conn = _audit_conn()
+        with conn:
+            conn.execute(
+                "UPDATE views SET bytes = bytes + ?, watched_seconds = watched_seconds + ?,"
+                " last_seen = ? WHERE token = ?",
+                (pending, watched, time.time(), token),
+            )
+        conn.close()
+    except Exception:
+        # Put the bytes back, as record_egress() does, so a bad moment makes
+        # the log lag rather than under-report.
+        with _audit_lock:
+            _audit_bytes[token] = _audit_bytes.get(token, 0) + pending
+        log.exception("audit flush failed")
+
+
+def audit_recent(days=AUDIT_PAGE_DAYS):
+    """Audit rows from the last `days`, newest first, including unwritten bytes."""
+    try:
+        conn = _audit_conn()
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM views WHERE started_at >= ? ORDER BY started_at DESC",
+            (time.time() - days * 86400,))]
+        conn.close()
+    except Exception:
+        log.exception("audit read failed")
+        return []
+    with _audit_lock:
+        for row in rows:
+            row["bytes"] += _audit_bytes.get(row["token"], 0)
+    return rows
+
+
 def lan_switch_context():
     """Template variables for the "you could be on the LAN" behaviour.
 
@@ -506,7 +665,26 @@ def verify_login(username, password):
 
 
 def current_user():
+    login_at = session.get("login_at")
+    if not isinstance(login_at, (int, float)) or             time.time() - login_at > SESSION_LIFETIME_HOURS * 3600:
+        # Covers sessions minted before login_at existed, too: they predate
+        # the 24h cap, so they get one more login rather than living forever.
+        if session:
+            session.clear()
+        return None
     return session.get("user")
+
+
+def _start_session(username, login_at=None):
+    """A fresh session for `username`, remembered for SESSION_LIFETIME_HOURS.
+
+    `login_at` is carried over by a handoff, so moving between hostnames
+    keeps the original login time rather than restarting the clock.
+    """
+    session.clear()
+    session["user"] = username
+    session["login_at"] = login_at if login_at is not None else time.time()
+    session.permanent = True
 
 
 def _safe_next(target):
@@ -544,9 +722,7 @@ def login():
         else:
             username = (request.form.get("username") or "").strip()
             if verify_login(username, request.form.get("password")):
-                session.clear()
-                session["user"] = username
-                session.permanent = False
+                _start_session(username)
                 with _login_lock:
                     _login_failures.pop(ip, None)
                 log.info("login ok user=%s ip=%s", username, ip)
@@ -612,7 +788,8 @@ def ping():
 @login_required
 def handoff_token():
     """Mint a short-lived token that moves this session to the other hostname."""
-    token = _handoff_serializer().dumps(current_user())
+    token = _handoff_serializer().dumps(
+        {"user": current_user(), "login_at": session["login_at"]})
     return jsonify({"token": token, "max_age": HANDOFF_MAX_AGE_SECONDS})
 
 
@@ -621,7 +798,7 @@ def handoff():
     """Consume a handoff token and start a session for the named user."""
     token = request.args.get("t", "")
     try:
-        username = _handoff_serializer().loads(
+        payload = _handoff_serializer().loads(
             token, max_age=HANDOFF_MAX_AGE_SECONDS
         )
     except SignatureExpired:
@@ -630,6 +807,11 @@ def handoff():
     except BadSignature:
         log.warning("handoff token invalid")
         return redirect(url_for("login"))
+    if not isinstance(payload, dict):
+        # The pre-24h format: a bare username with no login time to inherit.
+        log.warning("handoff token in old format")
+        return redirect(url_for("login"))
+    username, login_at = payload.get("user"), payload.get("login_at")
 
     # Single use. One gunicorn worker holds all of this, which is the same
     # reason live-stream tokens work at all here.
@@ -648,8 +830,8 @@ def handoff():
         log.warning("handoff for unknown user=%s", username)
         return redirect(url_for("login"))
 
-    session.clear()
-    session["user"] = username
+    # The original login time, so hopping hosts can't stretch the 24h window.
+    _start_session(username, login_at=login_at)
     log.info("handoff accepted user=%s host=%s", username, request.host)
     return redirect("/")
 
@@ -752,13 +934,26 @@ def resolve_stream_name(camera, audio_allowed, quality, want_audio=False):
 @login_required
 def heartbeat():
     """Keeps a live session alive; stops being called when the viewer goes away."""
-    token = request.json.get("token") if request.is_json else None
+    body = request.json if request.is_json else {}
+    token = body.get("token")
     if not token:
         abort(400)
+    now = time.time()
     with _sessions_lock:
         entry = _live_sessions.get(token)
-        if entry and entry["user"] == current_user():
-            entry["seen"] = time.time()
+        alive = (bool(entry) and entry["user"] == current_user()
+                 and now - entry["seen"] <= entry.get("timeout", HEARTBEAT_TIMEOUT_SECONDS))
+        if alive:
+            gap = now - entry["seen"]
+            entry["seen"] = now
+    if not alive:
+        # 410 rather than a cheerful ok: a page coming back from a long spell
+        # in the background has a token the server already let go of, and
+        # restarting streams on it would only collect 403s. This tells the
+        # page to reload for a fresh one instead.
+        return jsonify({"ok": False}), 410
+    watched = min(gap, AUDIT_MAX_BEAT_GAP_SECONDS) if body.get("watching") else 0
+    audit_flush(token, watched)
     return jsonify({"ok": True})
 
 
@@ -865,12 +1060,24 @@ def _authorise_hls(session_id):
         if not entry or entry["user"] != current_user():
             abort(403)
         entry["seen"] = time.time()
-        camera, metered = entry["camera"], entry["metered"]
+        camera, metered, token = entry["camera"], entry["metered"], entry.get("token")
+
+    # The same heartbeat rule pump() applies per chunk on the MP4 path. HLS
+    # never had it: iOS's native player keeps fetching segments on its own
+    # while the phone is locked or the app is in the background, and nothing
+    # here stopped it -- the cause of a phone quietly using ~100 MB while
+    # nobody was looking.
+    with _sessions_lock:
+        live_entry = _live_sessions.get(token)
+        alive = bool(live_entry) and time.time() - live_entry["seen"] <= live_entry.get(
+            "timeout", HEARTBEAT_TIMEOUT_SECONDS)
+    if not alive:
+        abort(403)
 
     allowed, _, _, _ = check_permission(current_user(), load_permissions())
     if camera not in allowed:
         abort(403)
-    return camera, metered
+    return camera, metered, token
 
 
 @app.route("/live/<camera>/master.m3u8")
@@ -956,6 +1163,7 @@ def live_hls(camera):
                 "camera": camera,
                 "quality": quality,
                 "metered": metered,
+                "token": token,
                 "seen": time.time(),
             }
 
@@ -985,7 +1193,7 @@ def hls_proxy(sub):
     if ".." in sub or sub.startswith("/"):
         abort(400)
 
-    camera, metered = _authorise_hls(request.args.get("id"))
+    camera, metered, token = _authorise_hls(request.args.get("id"))
     conn_id = _sanitize_conn_id(request.args.get("conn"))
 
     upstream = requests.get(
@@ -1011,6 +1219,7 @@ def hls_proxy(sub):
     if metered:
         record_egress(len(body), flush=sub.endswith(".m3u8"))
     _record_stream_bytes(conn_id, len(body))
+    audit_bytes(token, len(body))
 
     content_type = upstream.headers.get(
         "Content-Type",
@@ -1113,6 +1322,7 @@ def live(camera):
                 if metered:
                     record_egress(len(chunk))
                 _record_stream_bytes(conn_id, len(chunk))
+                audit_bytes(token, len(chunk))
                 yield chunk
         finally:
             upstream.close()
@@ -1121,6 +1331,7 @@ def live(camera):
                     _full_streams.discard(stream_id)
             if metered:
                 record_egress(0, flush=True)
+            audit_flush(token)
             log.info("live end camera=%s quality=%s reason=%s bytes=%d metered=%s",
                      camera, quality, why, sent, metered)
 
@@ -1925,6 +2136,7 @@ def dashboard():
         _live_sessions[token] = {"seen": time.time(), "user": username,
                                  "timeout": heartbeat_timeout}
     _prune_stale_sessions()
+    audit_start(token, username)
 
     used = egress_this_month()
     return render_template(
@@ -1935,6 +2147,11 @@ def dashboard():
         # user would be refused.
         recordings_allowed=bool(
             user_entries(permissions).get(username, {}).get("recordings")),
+        audit_allowed=bool(user_entries(permissions).get(username, {}).get("audit")),
+        # SD away from home: every frame on the public route crosses the home
+        # uplink and is billed as AWS egress, and SD is roughly a tenth of the
+        # cost. At home there is nothing to save, so HD.
+        default_quality="sub" if is_public_request() else "full",
         cameras=[{"name": c, "label": display_name(c)} for c in sorted(allowed_cameras)],
         audio_cameras=sorted(audio_cameras),
         ptz_cameras=sorted(controllable_cameras),
@@ -1951,6 +2168,20 @@ def dashboard():
         # -- and only if a LAN hostname exists to send them to.
         **lan_switch_context(),
     )
+
+
+@app.route("/audit")
+@login_required
+def audit():
+    """Who watched, from what, from where, for how long, and how much it moved.
+
+    A separate grant (`audit: true`) rather than riding on `recordings`: it
+    shows every account's viewing, which is its own kind of access.
+    """
+    if not user_entries(load_permissions()).get(current_user(), {}).get("audit"):
+        abort(403)
+    return render_template("audit.html", username=current_user(),
+                           views=audit_recent(), days=AUDIT_PAGE_DAYS)
 
 
 # The method list is not decoration. It was GET/POST only, which silently

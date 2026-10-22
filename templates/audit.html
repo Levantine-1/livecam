@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>livecam &middot; audit log</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#14161a; color:#e8eaed; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:1rem; padding:.75rem 1rem; background:#1c1f26; border-bottom:1px solid #2a2f3a; }
+  header h1 { font-size:1rem; margin:0; font-weight:600; letter-spacing:.02em; }
+  header .who { color:#9aa3b2; font-size:.85rem; }
+  header a { color:#7db3ff; text-decoration:none; font-size:.85rem; }
+  header .spacer { margin-left:auto; }
+  main { padding:1rem; }
+  .note { color:#9aa3b2; font-size:.8rem; margin:0 0 1rem; }
+  .empty { color:#9aa3b2; }
+  /* Scrolls sideways on a phone rather than squeezing seven columns into
+     unreadable slivers. */
+  .wrap { overflow-x:auto; border:1px solid #2a2f3a; border-radius:8px; }
+  table { width:100%; border-collapse:collapse; font-size:.85rem; }
+  th, td { padding:.5rem .75rem; text-align:left; white-space:nowrap; border-bottom:1px solid #2a2f3a; }
+  th { background:#1c1f26; color:#9aa3b2; font-weight:600; font-size:.75rem;
+       text-transform:uppercase; letter-spacing:.04em; }
+  tr:last-child td { border-bottom:0; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .route { font-size:.7rem; padding:.1rem .4rem; border-radius:4px; background:#2a2f3a; color:#9aa3b2; }
+  .route.WAN { background:#3a2f19; color:#f0d9a8; }
+</style>
+</head>
+<body>
+<header>
+  <h1>livecam</h1>
+  <span class="who">{{ username }}</span>
+  <span class="spacer"></span>
+  <a href="/">&larr; live view</a>
+</header>
+<main>
+  <p class="note">
+    Every visit to the live view over the last {{ days }} days. <em>Watched</em> counts only time a
+    video was actually playing on screen &mdash; not time in a background tab or a locked phone.
+    WAN visits came through AWS and count against the data allowance; LAN visits stayed at home.
+  </p>
+  {% if views %}
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr><th>When</th><th>User</th><th>Device</th><th>IP</th><th>Route</th>
+            <th>Watched</th><th>Data</th></tr>
+      </thead>
+      <tbody>
+        {% for v in views %}
+        <tr>
+          <td data-ts="{{ v.started_at }}"></td>
+          <td>{{ v.user }}</td>
+          <td>{{ v.device }}</td>
+          <td>{{ v.ip }}</td>
+          <td><span class="route {{ v.route }}">{{ v.route }}</span></td>
+          <td class="num" data-seconds="{{ v.watched_seconds }}"></td>
+          <td class="num" data-bytes="{{ v.bytes }}"></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No viewing recorded yet.</p>
+  {% endif %}
+</main>
+<script>
+// Times are stored as UTC epoch seconds and rendered here, so they read in
+// the viewer's own timezone rather than the container's.
+const when = new Intl.DateTimeFormat(undefined, {
+  weekday:'short', day:'numeric', month:'short', hour:'numeric', minute:'2-digit' });
+document.querySelectorAll('[data-ts]').forEach(td => {
+  td.textContent = when.format(new Date(Number(td.dataset.ts) * 1000));
+});
+
+document.querySelectorAll('[data-seconds]').forEach(td => {
+  const s = Math.round(Number(td.dataset.seconds));
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
+  td.textContent = h ? `${h}h ${m}m` : m ? `${m}m ${sec}s` : `${sec}s`;
+});
+
+document.querySelectorAll('[data-bytes]').forEach(td => {
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0, n = Number(td.dataset.bytes);
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  td.textContent = `${n < 10 && i > 0 ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
+});
+</script>
+</body>
+</html>

@@ -33,7 +33,6 @@
   figure video { width:100%; display:block; background:#000; aspect-ratio:16/9; object-fit:contain; }
   figcaption { display:flex; align-items:center; gap:.5rem; padding:.5rem .75rem; font-size:.9rem; }
   .badge { font-size:.7rem; padding:.1rem .4rem; border-radius:4px; background:#2a2f3a; color:#9aa3b2; }
-  .hint { margin-left:auto; color:#6b7484; font-size:.75rem; }
   .empty { padding:2rem 1rem; color:#9aa3b2; }
   dialog { border:1px solid #2a2f3a; background:#1c1f26; color:#e8eaed; border-radius:8px; padding:1.25rem; }
   dialog button { margin-top:1rem; padding:.5rem 1rem; border-radius:6px; border:0; background:#2f6fd0; color:#fff; font-size:1rem; }
@@ -46,7 +45,15 @@
                          padding:.4rem .8rem; font-size:.85rem; cursor:pointer; }
   #overlay .bar button:hover { background:#3d4757; }
   #overlay .bar .right { margin-left:auto; display:flex; align-items:center; gap:.5rem; }
-  #overlay video { flex:1; min-height:0; width:100%; background:#000; object-fit:contain; }
+  /* The stage clips the video so it can be zoomed and panned in place (see
+     the digital zoom script) without the page itself scrolling or zooming. */
+  #videoStage { flex:1; min-height:0; position:relative; overflow:hidden; background:#000; }
+  #videoStage video { display:block; width:100%; height:100%; object-fit:contain;
+                      transform-origin:0 0; }
+  #videoStage.zoomed { cursor:grab; }
+  #videoStage.zoomed:active { cursor:grabbing; }
+  #overlay .bar .qualityLabel { font-size:.8rem; color:#9aa3b2; }
+  #overlay .bar #zoomBadge[hidden] { display:none; }
   #overlay .bar #soundBtn.on { background:#2f6fd0; }
   #overlay .bar .qualityBtn.on { background:#2e9e44; }
   #gainWrap[hidden] { display:none; }
@@ -117,6 +124,7 @@
   <h1>livecam</h1>
   <span class="who">{{ username }}</span>
   <span class="spacer"></span>
+  {% if audit_allowed %}<a href="/audit">audit log</a>{% endif %}
   {% if recordings_allowed %}<a href="/frigate/">recordings &amp; timeline &rarr;</a>{% endif %}
   <a href="{{ url_for('logout') }}">sign out</a>
 </header>
@@ -167,7 +175,6 @@
     <figcaption>
       {{ cam.label }}
       <span class="badge res">&mdash;</span>
-      <span class="hint">click for full quality</span>
     </figcaption>
   </figure>
   {% endfor %}
@@ -182,12 +189,18 @@
     <span class="badge" id="overlayRes">&mdash;</span>
     <span class="badge" id="overlayRate">&mdash;</span>
     <span class="badge" id="overlayTotal">&mdash;</span>
+    <!-- Shared by everyone watching away from home, so it can drop while
+         this viewer is on the LAN and costing nothing. -->
+    <span class="badge" id="overlayLeft"
+          title="AWS free allowance remaining this month (shared by everyone watching away from home)">&mdash;</span>
     <div class="right">
       <!-- Unlike sound/PTZ, quality isn't permission-gated per camera or
            user -- every camera has both a main and secondary stream, so
            these are always visible rather than shown/hidden per camera. -->
-      <button id="qualityMainBtn" class="qualityBtn" type="button" aria-pressed="true">Primary</button>
-      <button id="qualitySecondaryBtn" class="qualityBtn" type="button" aria-pressed="false">Secondary</button>
+      <button id="zoomBadge" type="button" title="Reset zoom (or double-click the video)" hidden></button>
+      <span class="qualityLabel">Quality:</span>
+      <button id="qualityMainBtn" class="qualityBtn" type="button" aria-pressed="false">HD</button>
+      <button id="qualitySecondaryBtn" class="qualityBtn" type="button" aria-pressed="false">SD</button>
       <!-- Shown/hidden per camera exactly like ptzPad itself -- nothing to
            toggle on a camera with no PTZ. Resets to visible ("Hide PTZ") on
            every camera open, matching ptzPad's own default-visible state. -->
@@ -212,7 +225,9 @@
     </div>
   </div>
   <!-- Always starts muted, exactly like the tiles that have always worked. -->
-  <video id="overlayVideo" autoplay playsinline muted></video>
+  <div id="videoStage">
+    <video id="overlayVideo" autoplay playsinline muted></video>
+  </div>
   <p class="notice" id="overlayNotice" hidden></p>
 
   <!-- Rendered unconditionally, like the sound button above -- shown or
@@ -307,6 +322,11 @@ const overlayVideo = document.getElementById('overlayVideo');
 const overlayName = document.getElementById('overlayName');
 const overlayRateEl = document.getElementById('overlayRate');
 const overlayTotalEl = document.getElementById('overlayTotal');
+const overlayLeftEl = document.getElementById('overlayLeft');
+// SD on the public route, HD at home -- decided server-side from the
+// hostname. A manual pick replaces it for the rest of this page's life, so
+// choosing HD once doesn't have to be repeated for every camera.
+let preferredQuality = {{ default_quality | tojson }};
 const dlg = document.getElementById('idle');
 const tapToPlay = document.getElementById('tapToPlay');
 const qualityMainBtn = document.getElementById('qualityMainBtn');
@@ -579,9 +599,13 @@ function watchUsage(connId) {
   clearInterval(usagePollTimer);
   if (overlayRateEl) overlayRateEl.textContent = '—';
   if (overlayTotalEl) overlayTotalEl.textContent = '—';
-  let lastBytes = 0, lastAt = Date.now();
+  let lastBytes = 0, lastAt = Date.now(), polls = 0;
+  refreshUsage();
   usagePollTimer = setInterval(async () => {
     if (overlay.hidden) return;
+    // The allowance moves slowly and is one shared number, so every ~15s
+    // is plenty -- not every rate poll.
+    if (++polls % 10 === 0) refreshUsage();
     try {
       const r = await fetch(`/api/stream-usage?conn=${encodeURIComponent(connId)}`);
       if (!r.ok) return;
@@ -648,9 +672,10 @@ function expand(cam) {
   overlay.hidden = false;
   say('');
   autoDowngraded = false;
+  resetZoom();
   // Muted and audio-free by default. Sound is a separate, explicit act --
   // see the sound button below.
-  loadOverlay(cam, 'full', soundOn);
+  loadOverlay(cam, preferredQuality, soundOn);
   // History entry so the browser Back button is a natural way out, which
   // the native Fullscreen API cannot offer (Esc exits it, Back does not).
   history.pushState({ expanded: cam }, '');
@@ -687,7 +712,7 @@ function watchForStall() {
     if (stuck >= STALL_DOWNGRADE_S && currentQuality === 'full') {
       clearInterval(stallTimer);
       autoDowngraded = true;
-      say('Full quality was not keeping up here, so this dropped to the lower-resolution stream.');
+      say('HD was not keeping up here, so this dropped to SD.');
       loadOverlay(current, 'sub', false);
     } else if (stuck >= STALL_RECONNECT_S) {
       clearInterval(stallTimer);
@@ -704,7 +729,7 @@ function watchForStall() {
       if (autoDowngraded && currentQuality === 'sub' && healthy >= AUTO_UPGRADE_STABLE_S) {
         clearInterval(stallTimer);
         autoDowngraded = false;
-        say('Trying full quality again…');
+        say('Trying HD again…');
         loadOverlay(current, 'full', soundOn);
       } else if (wasStuck) {
         say('');
@@ -720,6 +745,7 @@ function collapse() {
   if (overlayRateEl) overlayRateEl.textContent = '—';
   if (overlayTotalEl) overlayTotalEl.textContent = '—';
   stopVideo(overlayVideo);
+  resetZoom();
   // Safety net: closing the view while a direction is still held (Esc mid-
   // press, a tab switch that eats the pointerup) must not leave a real
   // camera creeping after the UI it was controlled from is gone.
@@ -743,12 +769,14 @@ function collapse() {
 if (qualityMainBtn) {
   qualityMainBtn.addEventListener('click', () => {
     autoDowngraded = false;
+    preferredQuality = 'full';
     if (current && currentQuality !== 'full') loadOverlay(current, 'full', soundOn);
   });
 }
 if (qualitySecondaryBtn) {
   qualitySecondaryBtn.addEventListener('click', () => {
     autoDowngraded = false;
+    preferredQuality = 'sub';
     if (current && currentQuality !== 'sub') loadOverlay(current, 'sub', soundOn);
   });
 }
@@ -1230,15 +1258,31 @@ let beat = null;
 ['mousemove','keydown','click','touchstart','scroll'].forEach(
   e => addEventListener(e, () => { lastActive = Date.now(); }, {passive:true}));
 
+// Whether a video is actually on screen and moving -- what the audit log's
+// "watched" time counts. A page sitting behind the idle dialog or in the
+// background is open, not watched.
+const isWatching = () => !document.hidden && !dlg.open &&
+  (overlay.hidden ? tiles.some(v => !v.paused) : !overlayVideo.paused);
+
+// 410 means the server already let this page's token go (it sat in the
+// background past the heartbeat timeout). Every stream would 403 on it, so
+// a reload -- which mints a fresh one -- is the only useful answer.
+async function postBeat() {
+  const r = await fetch('/api/heartbeat', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({token: TOKEN, watching: isWatching()})
+  });
+  if (r.status === 410) location.reload();
+  return r;
+}
+
 async function sendBeat() {
+  // Hidden is checked first: a phone in a pocket is not an idle viewer, and
+  // must not come back to a "still watching?" prompt -- the streams were
+  // already stopped when it went to the background.
+  if (document.hidden) return;
   if (Date.now() - lastActive > IDLE_MS) return pauseAll();
-  if (document.hidden) return;   // a backgrounded tab otherwise keeps pulling video
-  try {
-    await fetch('/api/heartbeat', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({token: TOKEN})
-    });
-  } catch (e) { /* transient; next beat retries */ }
+  try { await postBeat(); } catch (e) { /* transient; next beat retries */ }
 }
 
 function pauseAll() {
@@ -1279,6 +1323,7 @@ const fmtBytes = b => {
 };
 
 function renderUsage(bytes) {
+  if (overlayLeftEl) overlayLeftEl.textContent = `${fmtBytes(Math.max(FREE_BYTES - bytes, 0))} left`;
   const pct = FREE_BYTES > 0 ? (bytes / FREE_BYTES) * 100 : 0;
   usageText.textContent =
     `Camera traffic via AWS this month: ${fmtBytes(bytes)} of ${fmtBytes(FREE_BYTES)} free `
@@ -1306,14 +1351,132 @@ tapToPlay.addEventListener('click', () => {
   tiles.forEach(v => startStream(v, v.dataset.camera, 'sub', false));
 });
 
-// Phones stop decoding when the tab goes to the background and do not always
-// resume on return -- which looks identical to the bug this replaced. Nudge
-// the tiles when the page becomes visible again, but only if nothing is
-// expanded (the overlay owns the screen in that case).
+// --- background: stop streaming, pick up where it left off -------------------
+// Switching apps or locking the phone used to leave every stream running:
+// skipping heartbeats only got the server to cut MP4 after its timeout, and
+// iOS's native HLS player kept fetching segments on its own regardless --
+// ~100 MB for a glance at the cameras. So going to the background now stops
+// everything outright, which closes the connections at once, and coming back
+// restarts exactly what was on screen.
+let suspended = null;   // what was showing when the page went to the background
+
+function suspendForBackground() {
+  if (suspended || dlg.open) return;
+  if (!overlay.hidden) {
+    suspended = { camera: current, quality: currentQuality, sound: soundOn };
+    clearInterval(stallTimer); stallTimer = null;
+    clearInterval(usagePollTimer); usagePollTimer = null;
+    stopVideo(overlayVideo);
+    ptzStopActive();
+  } else {
+    suspended = { tiles: true };
+  }
+  stopTiles();
+}
+
+async function resumeFromBackground() {
+  const was = suspended;
+  suspended = null;
+  if (!was || dlg.open) return;
+  // Coming back to the page is the viewer being here, whatever happened to
+  // the activity timer while it was hidden.
+  lastActive = Date.now();
+  try {
+    // A beat first: if the token lapsed while hidden this reloads instead,
+    // rather than restarting streams that would all be refused.
+    if ((await postBeat()).status === 410) return;
+  } catch (e) { /* offline for a moment; the streams' own retry covers it */ }
+  if (was.camera && !overlay.hidden && current === was.camera) {
+    loadOverlay(was.camera, was.quality, was.sound);
+  } else if (overlay.hidden) {
+    startTiles();
+  }
+}
+
 addEventListener('visibilitychange', () => {
-  if (document.hidden || !overlay.hidden || dlg.open) return;
-  tiles.forEach(v => { if (v.paused) startStream(v, v.dataset.camera, 'sub', false, showTapToPlay); });
+  if (document.hidden) suspendForBackground(); else resumeFromBackground();
 });
+// pagehide covers what visibilitychange can miss on mobile -- the browser
+// discarding or bfcaching the page -- and pageshow brings a bfcached one back.
+addEventListener('pagehide', suspendForBackground);
+addEventListener('pageshow', e => { if (e.persisted) resumeFromBackground(); });
+
+// --- digital zoom on the expanded video (desktop) ---------------------------
+// On a phone, pinch already zooms the page, video included. On a desktop the
+// wheel and trackpad pinch zoomed the page chrome while the video stayed put,
+// so they zoom the video itself here instead: toward the pointer, then drag
+// to pan, double-click (or the badge) to reset. Touch is left alone so phone
+// pinch keeps working exactly as before.
+const stage = document.getElementById('videoStage');
+const zoomBadge = document.getElementById('zoomBadge');
+const ZOOM_MAX = 8;
+let zoom = { s: 1, x: 0, y: 0 };
+
+function applyZoom() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  zoom.s = Math.min(Math.max(zoom.s, 1), ZOOM_MAX);
+  // Clamped so an edge of the picture can never be dragged inside the frame.
+  zoom.x = Math.min(0, Math.max(w - w * zoom.s, zoom.x));
+  zoom.y = Math.min(0, Math.max(h - h * zoom.s, zoom.y));
+  overlayVideo.style.transform =
+    zoom.s === 1 ? '' : `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.s})`;
+  stage.classList.toggle('zoomed', zoom.s > 1);
+  zoomBadge.hidden = zoom.s <= 1;
+  zoomBadge.textContent = `${zoom.s.toFixed(1)}\u00d7 \u2715`;
+}
+
+function zoomAt(factor, clientX, clientY) {
+  const r = stage.getBoundingClientRect();
+  const px = clientX - r.left, py = clientY - r.top;
+  const next = Math.min(Math.max(zoom.s * factor, 1), ZOOM_MAX);
+  // Keep the point under the pointer where it is while the scale changes.
+  zoom.x = px - (px - zoom.x) * (next / zoom.s);
+  zoom.y = py - (py - zoom.y) * (next / zoom.s);
+  zoom.s = next;
+  applyZoom();
+}
+
+function resetZoom() { zoom = { s: 1, x: 0, y: 0 }; applyZoom(); }
+
+// Trackpad pinch arrives as a wheel event with ctrlKey set (Chrome, Edge,
+// Firefox), with much smaller deltas than a mouse wheel notch -- hence the
+// two rates. preventDefault is what stops the page zooming instead.
+stage.addEventListener('wheel', e => {
+  e.preventDefault();
+  const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;   // Firefox line mode
+  zoomAt(Math.exp(-dy * (e.ctrlKey ? 0.01 : 0.0015)), e.clientX, e.clientY);
+}, { passive: false });
+
+// Desktop Safari reports trackpad pinch as its own gesture events instead.
+// Not registered on touch devices, where the same events are the phone's
+// native pinch -- which is meant to stay as it is.
+if (!('ontouchstart' in window)) {
+  let gestureBase = 1;
+  stage.addEventListener('gesturestart', e => { e.preventDefault(); gestureBase = zoom.s; });
+  stage.addEventListener('gesturechange', e => {
+    e.preventDefault();
+    zoomAt(gestureBase * e.scale / zoom.s, e.clientX, e.clientY);
+  });
+}
+
+let drag = null;
+stage.addEventListener('pointerdown', e => {
+  if (e.pointerType === 'touch' || e.button !== 0 || zoom.s <= 1) return;
+  drag = { id: e.pointerId, x: e.clientX - zoom.x, y: e.clientY - zoom.y };
+  stage.setPointerCapture(e.pointerId);
+});
+stage.addEventListener('pointermove', e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  zoom.x = e.clientX - drag.x;
+  zoom.y = e.clientY - drag.y;
+  applyZoom();
+});
+const endDrag = e => { if (drag && e.pointerId === drag.id) drag = null; };
+stage.addEventListener('pointerup', endDrag);
+stage.addEventListener('pointercancel', endDrag);
+stage.addEventListener('dblclick', resetZoom);
+zoomBadge.addEventListener('click', resetZoom);
+addEventListener('resize', () => { if (zoom.s > 1) applyZoom(); });
 
 startTiles();
 watchTilesForStall();

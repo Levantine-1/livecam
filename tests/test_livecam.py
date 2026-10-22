@@ -15,6 +15,8 @@ import re
 import sqlite3
 import sys
 import tempfile
+import time
+from email.utils import parsedate_to_datetime
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -23,6 +25,7 @@ WORK = tempfile.mkdtemp(prefix="livecam-test-")
 PERMS = os.path.join(WORK, "permissions.yml")
 CAMERAS = os.path.join(WORK, "cameras.yml")
 DB = os.path.join(WORK, "egress.db")
+AUDIT = os.path.join(WORK, "audit.db")
 
 # Both users share one hash so the fixture needs only one known password;
 # what differs between them is what they're allowed to see.
@@ -40,6 +43,7 @@ with open(PERMS, "w") as f:
         "  cameras: [the-boiz, the-gurlz]\n"
         "  audio: true\n"
         "  recordings: true\n"
+        "  audit: true\n"
         # Per-camera audio AND ptz, plus a camera listed for each that this
         # user cannot see -- neither grant may become a way to reach it.
         "partial:\n"
@@ -79,6 +83,7 @@ os.environ.update(
     PERMISSIONS_FILE=PERMS,
     CAMERAS_FILE=CAMERAS,
     EGRESS_DB=DB,
+    AUDIT_DB=AUDIT,
     FLASK_SECRET_KEY="test-secret",
     PUBLIC_HOSTNAME=PUB,
     LAN_HOSTNAME=LAN,
@@ -386,6 +391,10 @@ def main():
 
     r = c.post("/api/heartbeat", json={"token": token}, headers={"Host": PUB})
     check("heartbeat accepted for one's own token", r.status_code == 200, r.status_code)
+    # A page back from a long spell in the background must learn its token
+    # is gone, so it reloads rather than restarting streams that would 403.
+    r = c.post("/api/heartbeat", json={"token": "long-gone"}, headers={"Host": PUB})
+    check("heartbeat for an unknown token answers 410", r.status_code == 410, r.status_code)
     r = app.test_client().post("/api/heartbeat", json={"token": token},
                                headers={"Host": PUB})
     check("heartbeat rejected when logged out", r.status_code == 401, r.status_code)
@@ -654,6 +663,38 @@ def main():
         livecam._hls_sessions.clear()
     check("sessions idle past the activity window stop counting against the cap",
           stale_full == 0, stale_full)
+
+    # iOS's native player keeps fetching segments while the phone is locked.
+    # Segments must stop being served once the page's heartbeat lapses, the
+    # same rule the MP4 path applies per chunk.
+    hb_page = session_probe.get("/", headers={"Host": LAN}).get_data(as_text=True)
+    hb_token = re.search(r'const TOKEN = "([^"]+)"', hb_page).group(1)
+    with livecam._hls_lock:
+        livecam._hls_sessions["beatsid"] = {
+            "user": "admin", "camera": "the-boiz", "quality": "sub",
+            "metered": False, "token": hb_token, "seen": time.time(),
+        }
+    real_requests_get = livecam.requests.get
+    try:
+        livecam.requests.get = lambda *a, **kw: FakeUpstreamResponse(
+            200, "video/mp2t", [b"x" * 1000])
+        r = session_probe.get("/hls/segment.ts?id=beatsid", headers={"Host": LAN})
+        check("HLS segment served while the page's heartbeat is fresh",
+              r.status_code == 200, r.status_code)
+        with livecam._sessions_lock:
+            livecam._live_sessions[hb_token]["seen"] = time.time() - 10 ** 6
+        r = session_probe.get("/hls/segment.ts?id=beatsid", headers={"Host": LAN})
+        check("HLS segment refused once the page's heartbeat lapsed",
+              r.status_code == 403, r.status_code)
+        with livecam._hls_lock:
+            livecam._hls_sessions["nobeatsid"] = {
+                "user": "admin", "camera": "the-boiz", "quality": "sub",
+                "metered": False, "seen": time.time(),
+            }
+        r = session_probe.get("/hls/segment.ts?id=nobeatsid", headers={"Host": LAN})
+        check("HLS session with no live token is refused", r.status_code == 403, r.status_code)
+    finally:
+        livecam.requests.get = real_requests_get
 
     # --- per-camera audio, enforced server-side ---
     # The UI hiding a control proves nothing; what matters is which go2rtc
@@ -1041,6 +1082,88 @@ def main():
     livecam.CAMERAS_FILE = saved_cameras_file
     livecam.PERMISSIONS_FILE = saved_perms_file
 
+    # --- viewing audit log ---
+    check("user agents get readable device names",
+          livecam.describe_user_agent(
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0 Safari/537.36") == "Chrome on Windows"
+          and livecam.describe_user_agent(
+              "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 "
+              "(KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1") == "Safari on iPhone"
+          and livecam.describe_user_agent(
+              "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36") == "Chrome on Android"
+          and livecam.describe_user_agent(
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like "
+              "Gecko) Chrome/130.0 Safari/537.36 Edg/130.0") == "Edge on Windows"
+          and livecam.describe_user_agent(None) == "Unknown device")
+
+    viewer = app.test_client()
+    viewer.post("/login", data={"username": "admin", "password": PASSWORD},
+                headers={"Host": PUB})
+    edge_ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like "
+               "Gecko) Chrome/130.0 Safari/537.36 Edg/130.0")
+    page = viewer.get("/", headers={"Host": PUB, "User-Agent": edge_ua,
+                                    "X-Forwarded-For": "203.0.113.7"}).get_data(as_text=True)
+    view_token = re.search(r'const TOKEN = "([^"]+)"', page).group(1)
+    row = next((v for v in livecam.audit_recent() if v["token"] == view_token), None)
+    check("a dashboard load opens an audit row with device, IP and route",
+          row is not None and row["device"] == "Edge on Windows"
+          and row["ip"] == "203.0.113.7" and row["route"] == "WAN" and row["user"] == "admin",
+          row)
+
+    # Watched time comes only from beats that report a playing, visible video.
+    with livecam._sessions_lock:
+        livecam._live_sessions[view_token]["seen"] -= 60
+    viewer.post("/api/heartbeat", json={"token": view_token, "watching": False},
+                headers={"Host": PUB})
+    row = next(v for v in livecam.audit_recent() if v["token"] == view_token)
+    check("a beat with nothing playing adds no watched time",
+          row["watched_seconds"] == 0, row["watched_seconds"])
+    with livecam._sessions_lock:
+        livecam._live_sessions[view_token]["seen"] -= 60
+    livecam.audit_bytes(view_token, 4096)
+    viewer.post("/api/heartbeat", json={"token": view_token, "watching": True},
+                headers={"Host": PUB})
+    row = next(v for v in livecam.audit_recent() if v["token"] == view_token)
+    check("a watching beat adds the interval since the last beat",
+          59 <= row["watched_seconds"] <= 61, row["watched_seconds"])
+    check("streamed bytes are written to the audit row on the beat",
+          row["bytes"] == 4096, row["bytes"])
+    with livecam._sessions_lock:
+        livecam._live_sessions[view_token]["seen"] -= 3600
+    viewer.post("/api/heartbeat", json={"token": view_token, "watching": True},
+                headers={"Host": PUB})
+    row = next(v for v in livecam.audit_recent() if v["token"] == view_token)
+    check("one beat never credits more than the max gap (page was asleep)",
+          row["watched_seconds"] <= 61 + livecam.AUDIT_MAX_BEAT_GAP_SECONDS,
+          row["watched_seconds"])
+
+    r = viewer.get("/audit", headers={"Host": PUB})
+    audit_page = r.get_data(as_text=True)
+    check("the audit page lists viewing for a user with the grant",
+          r.status_code == 200 and "Edge on Windows" in audit_page
+          and "203.0.113.7" in audit_page, r.status_code)
+    family = app.test_client()
+    family.post("/login", data={"username": "partial", "password": PASSWORD},
+                headers={"Host": PUB})
+    r = family.get("/audit", headers={"Host": PUB})
+    check("the audit page is refused without the grant", r.status_code == 403, r.status_code)
+    check("no audit link for a user without the grant",
+          'href="/audit"' not in family.get("/", headers={"Host": PUB}).get_data(as_text=True))
+
+    check("audit link sits left of the recordings link",
+          'href="/audit"' in page and page.index('href="/audit"') < page.index('href="/frigate/"'))
+    check("quality buttons read HD / SD",
+          ">HD</button>" in page and ">SD</button>" in page and "Quality:" in page)
+    check("the WAN hostname opens cameras in SD by default",
+          'let preferredQuality = "sub";' in page)
+    lan_page = session_probe.get("/", headers={"Host": LAN}).get_data(as_text=True)
+    check("the LAN hostname opens cameras in HD by default",
+          'let preferredQuality = "full";' in lan_page)
+    check("the full-screen bar has a data-left badge", 'id="overlayLeft"' in page)
+    check("the expanded video sits in a zoomable stage", 'id="videoStage"' in page)
+
     # --- LAN switch: ping, handoff ---
     fresh = app.test_client()
     r = fresh.get("/api/ping", headers={"Host": LAN})
@@ -1078,7 +1201,7 @@ def main():
     check("a forged handoff token is refused",
           r.status_code == 302 and "/login" in r.headers["Location"], r.headers.get("Location"))
 
-    expired = livecam._handoff_serializer().dumps("admin")
+    expired = livecam._handoff_serializer().dumps({"user": "admin", "login_at": time.time()})
     saved, livecam.HANDOFF_MAX_AGE_SECONDS = livecam.HANDOFF_MAX_AGE_SECONDS, -1
     r = app.test_client().get(f"/handoff?t={expired}", headers={"Host": LAN})
     livecam.HANDOFF_MAX_AGE_SECONDS = saved
@@ -1086,9 +1209,53 @@ def main():
           r.status_code == 302 and "/login" in r.headers["Location"], r.headers.get("Location"))
 
     # Signed by this app's secret, but naming someone since removed.
-    ghost = livecam._handoff_serializer().dumps("deleted-user")
+    ghost = livecam._handoff_serializer().dumps(
+        {"user": "deleted-user", "login_at": time.time()})
     r = app.test_client().get(f"/handoff?t={ghost}", headers={"Host": LAN})
     check("handoff for a user no longer in permissions.yml is refused",
+          r.status_code == 302 and "/login" in r.headers["Location"], r.headers.get("Location"))
+
+    # Tokens minted before the 24h change carried a bare username.
+    old_format = livecam._handoff_serializer().dumps("admin")
+    r = app.test_client().get(f"/handoff?t={old_format}", headers={"Host": LAN})
+    check("an old-format handoff token is refused",
+          r.status_code == 302 and "/login" in r.headers["Location"], r.headers.get("Location"))
+
+    # --- a login is remembered for 24 hours, counted from the login ---
+    remembered = app.test_client()
+    r = remembered.post("/login", data={"username": "admin", "password": PASSWORD},
+                        headers={"Host": PUB})
+    cookie = r.headers.get("Set-Cookie", "")
+    expires = re.search(r"Expires=([^;]+)", cookie)
+    hours = ((parsedate_to_datetime(expires.group(1)).timestamp() - time.time()) / 3600
+             if expires else None)
+    check("login sets a persistent cookie expiring in ~24h",
+          hours is not None and 23.9 < hours <= 24, cookie)
+    with remembered.session_transaction(base_url=f"http://{PUB}") as sess:
+        login_at = sess["login_at"]
+    r = remembered.get("/", headers={"Host": PUB})
+    check("a session inside the window loads the dashboard", r.status_code == 200, r.status_code)
+    check("ordinary requests do not re-issue (and so extend) the cookie",
+          "Set-Cookie" not in r.headers, r.headers.get("Set-Cookie"))
+
+    r = remembered.post("/api/handoff", headers={"Host": PUB})
+    carried = app.test_client()
+    carried.get(f"/handoff?t={r.json['token']}", headers={"Host": LAN})
+    with carried.session_transaction(base_url=f"http://{LAN}") as sess:
+        check("a handoff keeps the original login time",
+              sess.get("login_at") == login_at, sess.get("login_at"))
+
+    with remembered.session_transaction(base_url=f"http://{PUB}") as sess:
+        sess["login_at"] = time.time() - 25 * 3600
+    r = remembered.get("/", headers={"Host": PUB, "Accept": "text/html"})
+    check("a session older than 24h is sent back to login",
+          r.status_code == 302 and "/login" in r.headers["Location"], r.headers.get("Location"))
+
+    stale = app.test_client()
+    with stale.session_transaction(base_url=f"http://{PUB}") as sess:
+        sess["user"] = "admin"  # minted before login_at existed
+    r = stale.get("/", headers={"Host": PUB, "Accept": "text/html"})
+    check("a pre-24h session with no login time must log in again",
           r.status_code == 302 and "/login" in r.headers["Location"], r.headers.get("Location"))
 
     # The switch offer must never appear on the host it would send you to.
@@ -1152,7 +1319,7 @@ def main():
         # Checked against the TEMPLATE, not this rendered page: several
         # elements (the home banner, the LAN switch) only appear on one
         # hostname, and the template holds every branch.
-        with open(os.path.join(REPO, "templates", "index.html")) as f:
+        with open(os.path.join(REPO, "templates", "index.html"), encoding="utf-8") as f:
             template_src = f.read()
         for el in sorted(set(re.findall(r"getElementById\('([^']+)'\)", js))):
             check(f"element #{el} referenced by the script exists in the markup",

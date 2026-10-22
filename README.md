@@ -55,6 +55,12 @@ disabled in favour of proxy authentication -- livecam passes the username on
 in `X-Forwarded-User`, which Frigate trusts because it is reachable only on
 the LAN. ZoneMinder needed a second account per person; this does not.
 
+A login is **remembered on the device for 24 hours**
+(`SESSION_LIFETIME_HOURS`), counted from the login itself rather than
+extended by activity, and enforced server-side as well as by the cookie's
+expiry. Switching to the LAN hostname carries the original login time
+across, so it neither asks for the password again nor restarts the clock.
+
 Access to the recorded archive is a **separate grant** (`recordings: true`)
 from live viewing. Frigate has no per-camera or per-audio gating matching
 this app's model -- anyone who reaches it sees every camera and hears
@@ -105,6 +111,25 @@ Oregon and back down again, billed as egress, so the dashboard shows a
 dismissible banner on that hostname only, linking to the LAN one. It is
 never shown on the LAN hostname, and dismissal is remembered per browser and
 per hostname in `localStorage`.
+
+## Audit log
+
+`/audit` lists every visit to the live view over the last 30 days: when, which
+account, the device (browser and platform, from the User-Agent), the IP,
+whether it came in over WAN or LAN, how long a video was actually watched,
+and how much data it moved. *Watched* counts only heartbeat intervals during
+which the browser reported a playing, visible video, so a tab left in the
+background or a locked phone does not inflate it. Rows live in SQLite beside
+the egress counter and are kept for 90 days. It is a separate grant,
+`audit: true`, because it shows every account's viewing.
+
+## Background viewing
+
+Switching apps, locking the phone or hiding the tab stops every stream at
+once, and coming back resumes exactly what was on screen. HLS segment
+requests (the iOS path) are refused once the page's heartbeat lapses, the
+same rule the MP4 path applies per chunk -- before this, iOS's native player
+kept fetching on its own while the phone was locked.
 
 ## Egress counter
 
@@ -178,6 +203,9 @@ its env vars, Vault-injected secrets and volumes are declared.
 | `FREE_TIER_BYTES` | Free-tier allowance the meter is drawn against (default 100 GB) |
 | `MAX_FULL_QUALITY_SESSIONS` | Concurrent full-res live viewers before extra ones are served the substream (default 4) |
 | `HEARTBEAT_TIMEOUT_SECONDS` | Live stream is torn down after this long without a heartbeat (default 600) |
+| `SESSION_LIFETIME_HOURS` | How long a login is remembered on a device, counted from the login (default 24) |
+| `AUDIT_DB` | SQLite path for the viewing audit log (default `/app/data/audit.db`) |
+| `AUDIT_RETENTION_DAYS` | How long audit rows are kept (default 90) |
 | `HANDOFF_MAX_AGE_SECONDS` | Validity window for a single-use public->LAN session handoff token (default 60) |
 | `SESSION_COOKIE_SECURE` | Off by default: plain HTTP to this container is a supported path (nginx-proxy runs `HTTPS_METHOD=noredirect`, and the AWS relay arrives over HTTP), and setting it without that being true end to end makes login loop silently |
 
