@@ -123,7 +123,23 @@ background or a locked phone does not inflate it. Rows live in SQLite beside
 the egress counter and are kept for 90 days. It is a separate grant,
 `audit: true`, because it shows every account's viewing.
 
+Above the history, **Active sessions** lists every page open right now --
+who, which device, and which cameras it is streaming at what quality --
+with a **Terminate** button. Terminating stops that device's streams at
+once and revokes its login (by a per-device session id, so other devices on
+the same account carry on); the device sees "Session ended" and must log in
+again. Revocations are kept in `audit.db`, so a restart cannot undo one.
+
+If livecam restarts (a deploy), open pages are not reloaded: their next
+heartbeat gets 410, they fetch a replacement token from `/api/token`, and
+restart their streams in place -- a camera open full screen stays open.
+
 ## Background viewing
+
+On the LAN hostname there is no "still watching?" prompt at all, and a
+login stays valid for as long as a video is actually playing (each heartbeat
+from a playing page slides the 24-hour window). The public hostname keeps
+both limits, since every byte there is billed.
 
 Switching apps, locking the phone or hiding the tab stops every stream at
 once, and coming back resumes exactly what was on screen. HLS segment
@@ -206,6 +222,7 @@ its env vars, Vault-injected secrets and volumes are declared.
 | `SESSION_LIFETIME_HOURS` | How long a login is remembered on a device, counted from the login (default 24) |
 | `AUDIT_DB` | SQLite path for the viewing audit log (default `/app/data/audit.db`) |
 | `AUDIT_RETENTION_DAYS` | How long audit rows are kept (default 90) |
+| `LAN_HEARTBEAT_TIMEOUT_SECONDS` | How long the server keeps a LAN page's token after its heartbeats stop (default 900) -- there is no idle prompt on the LAN |
 | `HANDOFF_MAX_AGE_SECONDS` | Validity window for a single-use public->LAN session handoff token (default 60) |
 | `SESSION_COOKIE_SECURE` | Off by default: plain HTTP to this container is a supported path (nginx-proxy runs `HTTPS_METHOD=noredirect`, and the AWS relay arrives over HTTP), and setting it without that being true end to end makes login loop silently |
 

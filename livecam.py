@@ -46,7 +46,7 @@ from functools import wraps
 
 import requests
 import yaml
-from flask import (Flask, Response, abort, jsonify, redirect, render_template,
+from flask import (Flask, Response, abort, g, jsonify, redirect, render_template,
                    request, send_file, session, stream_with_context, url_for)
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from onvif import ONVIFCamera
@@ -165,23 +165,25 @@ IDLE_PROMPT_SECONDS = int(os.environ.get("IDLE_PROMPT_SECONDS", str(max(60, HEAR
 
 # On the LAN none of the above applies: the whole point of the idle prompt is
 # that an abandoned tab quietly bills AWS egress, and LAN traffic costs
-# nothing. So the nag is pure cost with no benefit there.
+# nothing. So on the LAN there is no "still watching?" prompt at all -- a
+# screen left showing a camera at home is the intended use, not an accident.
 #
-# Not disabled outright, though -- an abandoned tab still holds a go2rtc
-# connection open, so 8 hours bounds that while being long enough that nobody
-# meets the dialog in practice.
-LAN_IDLE_PROMPT_SECONDS = int(os.environ.get("LAN_IDLE_PROMPT_SECONDS", str(8 * 60 * 60)))
-# The browser must give up BEFORE the server or teardown happens mid-request
-# rather than gracefully, so the two move together -- see the comment on
-# HEARTBEAT_TIMEOUT_SECONDS above.
-LAN_HEARTBEAT_TIMEOUT_SECONDS = LAN_IDLE_PROMPT_SECONDS + 600
+# What used to bound an abandoned LAN tab (an 8-hour prompt) is now done
+# without asking anyone: a hidden page stops its own streams, and a closed one
+# stops heart-beating, so the server lets its token go after this long. Short
+# enough that the audit page's "active sessions" list doesn't keep showing a
+# tab that was closed hours ago.
+LAN_HEARTBEAT_TIMEOUT_SECONDS = int(os.environ.get("LAN_HEARTBEAT_TIMEOUT_SECONDS", "900"))
 
 
 def idle_settings():
-    """(idle_prompt, heartbeat_timeout) for the route this request came in on."""
+    """(idle_prompt, heartbeat_timeout) for the route this request came in on.
+
+    An idle_prompt of 0 means never prompt.
+    """
     if is_public_request():
         return IDLE_PROMPT_SECONDS, HEARTBEAT_TIMEOUT_SECONDS
-    return LAN_IDLE_PROMPT_SECONDS, LAN_HEARTBEAT_TIMEOUT_SECONDS
+    return 0, LAN_HEARTBEAT_TIMEOUT_SECONDS
 
 
 def display_name(camera):
@@ -198,7 +200,17 @@ def display_name(camera):
     return override or camera.replace("-", " ").replace("_", " ").title()
 
 _sessions_lock = threading.Lock()
-_live_sessions = {}  # stream_token -> {"seen": epoch, "user": username}
+_live_sessions = {}  # stream_token -> {"seen", "user", "timeout", "sid", "started"}
+
+# MP4 streams currently being pumped, per live token, for the audit page's
+# "watching right now" column. (HLS needs no equivalent: _hls_sessions
+# already carries the token and a last-seen time.)
+_token_streams = {}  # token -> {stream key: {"camera", "quality", "since"}}
+
+# Tokens an administrator ended from the audit page. Kept so a page that asks
+# for a replacement token (/api/token) is told it was ended rather than being
+# quietly handed a new one.
+_terminated_tokens = set()
 
 # In-flight full-quality streams, so the cap below counts what is actually
 # being transferred rather than how many people have a page open. Tiles are
@@ -380,6 +392,15 @@ def _audit_conn():
         " route TEXT, started_at REAL NOT NULL, last_seen REAL NOT NULL,"
         " watched_seconds REAL NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0)"
     )
+    # Added 2026-10-25 for terminating sessions; ALTER rather than a new
+    # schema so existing history is kept.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(views)")}
+    for name, kind in (("sid", "TEXT"), ("terminated_at", "REAL"), ("terminated_by", "TEXT")):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE views ADD COLUMN {name} {kind}")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS revoked (sid TEXT PRIMARY KEY, at REAL NOT NULL, by TEXT)"
+    )
     return conn
 
 
@@ -423,18 +444,18 @@ def describe_user_agent(ua):
     return browser or platform or "Unknown device"
 
 
-def audit_start(token, username):
+def audit_start(token, username, sid=None):
     """Open the audit row for a freshly minted live token."""
     now = time.time()
     try:
         conn = _audit_conn()
         with conn:
             conn.execute(
-                "INSERT OR IGNORE INTO views (token, user, ip, device, route, started_at, last_seen)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO views (token, user, ip, device, route, started_at, last_seen, sid)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (token, username, _client_ip(),
                  describe_user_agent(request.headers.get("User-Agent")),
-                 "WAN" if is_public_request() else "LAN", now, now),
+                 "WAN" if is_public_request() else "LAN", now, now, sid),
             )
             conn.execute("DELETE FROM views WHERE last_seen < ?",
                          (now - AUDIT_RETENTION_DAYS * 86400,))
@@ -471,6 +492,46 @@ def audit_flush(token, watched=0.0):
         with _audit_lock:
             _audit_bytes[token] = _audit_bytes.get(token, 0) + pending
         log.exception("audit flush failed")
+
+
+def audit_rows(tokens):
+    """{token: audit row} for the given live tokens."""
+    if not tokens:
+        return {}
+    try:
+        conn = _audit_conn()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"SELECT * FROM views WHERE token IN ({','.join('?' * len(tokens))})", list(tokens)
+        ).fetchall()
+        conn.close()
+    except Exception:
+        log.exception("audit read failed")
+        return {}
+    return {r["token"]: dict(r) for r in rows}
+
+
+def audit_move(old, new, username):
+    """Carry one visit's audit row over to its replacement token, so a page
+    that re-mints its token (after a restart wiped the old one) is still one
+    visit in the log rather than two. False if there was no row to move."""
+    with _audit_lock:
+        pending = _audit_bytes.pop(old, 0)
+        if pending:
+            _audit_bytes[new] = _audit_bytes.get(new, 0) + pending
+    try:
+        conn = _audit_conn()
+        with conn:
+            moved = conn.execute(
+                "UPDATE views SET token = ?, last_seen = ? WHERE token = ? AND user = ?"
+                " AND terminated_at IS NULL",
+                (new, time.time(), old, username),
+            ).rowcount
+        conn.close()
+        return bool(moved)
+    except Exception:
+        log.exception("audit move failed")
+        return False
 
 
 def audit_recent(days=AUDIT_PAGE_DAYS):
@@ -664,14 +725,65 @@ def verify_login(username, password):
     return bool(stored) and ok
 
 
+# Login sessions ended from the audit page. Sessions are signed cookies, so
+# ending one means remembering its id here until it would have expired on
+# its own anyway. Held in memory -- current_user() runs on every segment
+# request -- and in audit.db so a restart can't revive a terminated device.
+_revoked_lock = threading.Lock()
+_revoked_sids = None  # loaded lazily from audit.db
+
+
+def _revoked():
+    global _revoked_sids
+    with _revoked_lock:
+        if _revoked_sids is None:
+            try:
+                conn = _audit_conn()
+                cutoff = time.time() - (SESSION_LIFETIME_HOURS + 1) * 3600
+                with conn:
+                    conn.execute("DELETE FROM revoked WHERE at < ?", (cutoff,))
+                _revoked_sids = {r[0] for r in conn.execute("SELECT sid FROM revoked")}
+                conn.close()
+            except Exception:
+                log.exception("revocation list unreadable")
+                return set()
+        return _revoked_sids
+
+
+def revoke_sid(sid, by):
+    _revoked()  # make sure the in-memory set is loaded before adding to it
+    with _revoked_lock:
+        _revoked_sids.add(sid)
+    try:
+        conn = _audit_conn()
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO revoked (sid, at, by) VALUES (?, ?, ?)",
+                         (sid, time.time(), by))
+        conn.close()
+    except Exception:
+        log.exception("revocation not persisted sid=%s", sid)
+
+
 def current_user():
     login_at = session.get("login_at")
-    if not isinstance(login_at, (int, float)) or             time.time() - login_at > SESSION_LIFETIME_HOURS * 3600:
+    if not isinstance(login_at, (int, float)) or \
+            time.time() - login_at > SESSION_LIFETIME_HOURS * 3600:
         # Covers sessions minted before login_at existed, too: they predate
         # the 24h cap, so they get one more login rather than living forever.
+        # On the LAN the window slides while a video is playing -- see
+        # heartbeat(); on the public site it never does.
         if session:
             session.clear()
         return None
+    sid = session.get("sid")
+    if sid and sid in _revoked():
+        g.session_terminated = True
+        session.clear()
+        return None
+    if not sid:
+        # Logged in before session ids existed: give it one now so it can
+        # still be terminated from the audit page.
+        session["sid"] = secrets.token_urlsafe(16)
     return session.get("user")
 
 
@@ -684,6 +796,9 @@ def _start_session(username, login_at=None):
     session.clear()
     session["user"] = username
     session["login_at"] = login_at if login_at is not None else time.time()
+    # Identifies this one device's login, so the audit page can end it
+    # without touching other devices signed in to the same account.
+    session["sid"] = secrets.token_urlsafe(16)
     session.permanent = True
 
 
@@ -704,6 +819,10 @@ def login_required(view):
         # an HTML page it will try to decode as video.
         if request.method == "GET" and "text/html" in request.headers.get("Accept", ""):
             return redirect(url_for("login", next=_safe_next(request.full_path)))
+        if getattr(g, "session_terminated", False):
+            # Distinct from a plain 401 so the page can say it was ended on
+            # purpose instead of just bouncing to the login form.
+            return jsonify({"terminated": True}), 403
         abort(401)
 
     return wrapped
@@ -947,14 +1066,58 @@ def heartbeat():
             gap = now - entry["seen"]
             entry["seen"] = now
     if not alive:
-        # 410 rather than a cheerful ok: a page coming back from a long spell
-        # in the background has a token the server already let go of, and
-        # restarting streams on it would only collect 403s. This tells the
-        # page to reload for a fresh one instead.
+        if token in _terminated_tokens:
+            return jsonify({"terminated": True}), 403
+        # 410 rather than a cheerful ok: the server no longer knows this
+        # token -- it sat in the background past the timeout, or livecam
+        # restarted and lost every token (deploys, and 2026-10-25's hourly
+        # restart loop). The page asks /api/token for a replacement and
+        # carries on in place; it used to reload, which dropped viewers out
+        # of full screen.
         return jsonify({"ok": False}), 410
-    watched = min(gap, AUDIT_MAX_BEAT_GAP_SECONDS) if body.get("watching") else 0
+    watching = bool(body.get("watching"))
+    if watching and not is_public_request():
+        # LAN only: a screen showing a camera at home stays logged in for as
+        # long as it is actually playing. Rewriting login_at re-signs the
+        # cookie on this response, sliding the 24h window. Never on the
+        # public site, and never for an idle or hidden page.
+        session["login_at"] = now
+    watched = min(gap, AUDIT_MAX_BEAT_GAP_SECONDS) if watching else 0
     audit_flush(token, watched)
     return jsonify({"ok": True})
+
+
+def _mint_token(username):
+    """A fresh live token for this page, registered for heartbeats."""
+    _, heartbeat_timeout = idle_settings()
+    token = secrets.token_urlsafe(24)
+    now = time.time()
+    with _sessions_lock:
+        _live_sessions[token] = {"seen": now, "user": username, "timeout": heartbeat_timeout,
+                                 "sid": session.get("sid"), "started": now}
+    _prune_stale_sessions()
+    return token
+
+
+@app.route("/api/token", methods=["POST"])
+@login_required
+def renew_token():
+    """Replace a token the server no longer knows, without reloading the page.
+
+    The page keeps whatever it was showing -- including a camera open full
+    screen -- and just restarts its streams on the new token. The visit's
+    audit row moves to the new token, so the log still shows one visit.
+    """
+    body = request.json if request.is_json else {}
+    old = body.get("old") or ""
+    if old in _terminated_tokens:
+        return jsonify({"terminated": True}), 403
+    username = current_user()
+    token = _mint_token(username)
+    if not (old and audit_move(old, token, username)):
+        audit_start(token, username, session.get("sid"))
+    log.info("token renewed user=%s", username)
+    return jsonify({"token": token})
 
 
 @app.route("/api/usage")
@@ -1302,6 +1465,10 @@ def live(camera):
     def pump():
         sent = 0
         why = "client disconnected"
+        stream_key = object()
+        with _sessions_lock:
+            _token_streams.setdefault(token, {})[stream_key] = {
+                "camera": camera, "quality": quality, "since": time.time()}
         try:
             for chunk in upstream.iter_content(chunk_size=64 * 1024):
                 # Re-checked per chunk so an abandoned tab, or a viewing
@@ -1312,7 +1479,7 @@ def live(camera):
                     last_seen = entry["seen"] if entry else None
                     session_timeout = (entry or {}).get("timeout", HEARTBEAT_TIMEOUT_SECONDS)
                 if last_seen is None or time.time() - last_seen > session_timeout:
-                    why = "heartbeat expired"
+                    why = "terminated" if token in _terminated_tokens else "heartbeat expired"
                     break
                 still_allowed, _, _, _ = check_permission(username, load_permissions())
                 if camera not in still_allowed:
@@ -1326,6 +1493,11 @@ def live(camera):
                 yield chunk
         finally:
             upstream.close()
+            with _sessions_lock:
+                streams = _token_streams.get(token, {})
+                streams.pop(stream_key, None)
+                if not streams:
+                    _token_streams.pop(token, None)
             if stream_id is not None:
                 with _sessions_lock:
                     _full_streams.discard(stream_id)
@@ -2130,13 +2302,9 @@ def dashboard():
     # Same two-gate rule for the speaker: granted AND declared `talk: true`.
     speakable_cameras = talk_cameras & talk_capable_cameras()
 
-    idle_prompt, heartbeat_timeout = idle_settings()
-    token = secrets.token_urlsafe(24)
-    with _sessions_lock:
-        _live_sessions[token] = {"seen": time.time(), "user": username,
-                                 "timeout": heartbeat_timeout}
-    _prune_stale_sessions()
-    audit_start(token, username)
+    idle_prompt, _ = idle_settings()
+    token = _mint_token(username)
+    audit_start(token, username, session.get("sid"))
 
     used = egress_this_month()
     return render_template(
@@ -2170,6 +2338,86 @@ def dashboard():
     )
 
 
+def _require_audit_grant():
+    if not user_entries(load_permissions()).get(current_user(), {}).get("audit"):
+        abort(403)
+
+
+@app.route("/api/sessions")
+@login_required
+def active_sessions():
+    """Pages currently open, newest first, with what each is streaming now."""
+    _require_audit_grant()
+    now = time.time()
+    with _sessions_lock:
+        live = {t: dict(e) for t, e in _live_sessions.items()
+                if now - e["seen"] <= e.get("timeout", HEARTBEAT_TIMEOUT_SECONDS)}
+        streams = {t: list(v.values()) for t, v in _token_streams.items()}
+    with _hls_lock:
+        for entry in _hls_sessions.values():
+            if entry.get("token") in live and entry["seen"] >= now - HLS_ACTIVE_SECONDS:
+                streams.setdefault(entry["token"], []).append(
+                    {"camera": entry["camera"], "quality": entry["quality"]})
+    rows = audit_rows(live)
+    with _audit_lock:
+        pending = {t: _audit_bytes.get(t, 0) for t in live}
+    me = session.get("sid")
+
+    out = []
+    for token, entry in live.items():
+        row = rows.get(token, {})
+        watching = {(s["camera"], s["quality"]) for s in streams.get(token, [])}
+        out.append({
+            "token": token,
+            "user": entry["user"],
+            "device": row.get("device") or "Unknown device",
+            "ip": row.get("ip") or "",
+            "route": row.get("route") or "",
+            "started": row.get("started_at") or entry.get("started"),
+            "last_seen": entry["seen"],
+            "bytes": (row.get("bytes") or 0) + pending.get(token, 0),
+            "watching": [{"camera": display_name(c), "quality": "HD" if q == "full" else "SD"}
+                         for c, q in sorted(watching)],
+            "self": bool(me) and entry.get("sid") == me,
+        })
+    out.sort(key=lambda s: s["started"] or 0, reverse=True)
+    return jsonify(out)
+
+
+@app.route("/api/sessions/<token>/terminate", methods=["POST"])
+@login_required
+def terminate_session(token):
+    """End one device's session: stop its streams now and sign it out.
+
+    Other devices signed in to the same account are untouched -- the login
+    is revoked by its own session id, not by username.
+    """
+    _require_audit_grant()
+    by = current_user()
+    with _sessions_lock:
+        entry = _live_sessions.pop(token, None)
+        _token_streams.pop(token, None)
+        if entry:
+            _terminated_tokens.add(token)
+    if not entry:
+        abort(404)
+    # Removing the token is what stops it: pump() checks it every chunk and
+    # _authorise_hls() on every segment. Revoking the sid is what keeps the
+    # device out afterwards, including across a reload.
+    if entry.get("sid"):
+        revoke_sid(entry["sid"], by)
+    try:
+        conn = _audit_conn()
+        with conn:
+            conn.execute("UPDATE views SET terminated_at = ?, terminated_by = ? WHERE token = ?",
+                         (time.time(), by, token))
+        conn.close()
+    except Exception:
+        log.exception("audit terminate note failed")
+    log.warning("session terminated user=%s by=%s sid=%s", entry["user"], by, entry.get("sid"))
+    return jsonify({"ok": True})
+
+
 @app.route("/audit")
 @login_required
 def audit():
@@ -2178,8 +2426,7 @@ def audit():
     A separate grant (`audit: true`) rather than riding on `recordings`: it
     shows every account's viewing, which is its own kind of access.
     """
-    if not user_entries(load_permissions()).get(current_user(), {}).get("audit"):
-        abort(403)
+    _require_audit_grant()
     return render_template("audit.html", username=current_user(),
                            views=audit_recent(), days=AUDIT_PAGE_DAYS)
 

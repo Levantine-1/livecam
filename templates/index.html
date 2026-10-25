@@ -257,6 +257,15 @@
   <button id="resume">Resume</button>
 </dialog>
 
+<!-- Shown when an administrator ends this device's session from the audit
+     page: the streams have already stopped server-side, and the login is
+     revoked, so the only way back is to sign in again. -->
+<dialog id="ended">
+  <strong>Session ended</strong>
+  <p>This session was ended by an administrator.</p>
+  <button id="endedLogin" type="button">Log in again</button>
+</dialog>
+
 <!-- Soundboard. Everything that makes noise in the room lives behind this one
      dialog, deliberately: it keeps the overlay bar (which already overflows on
      a phone) from growing, and it puts the volume control next to the sounds
@@ -312,7 +321,11 @@
 // only for the one camera actually being looked at. There is no server-side
 // downscale involved -- that would mean decode+scale+re-encode, which is the
 // exact workload that previously pinned the NVR host.
-const TOKEN = {{ token | tojson }};
+// let, not const: if the server forgets this token (it restarted, or the
+// page sat in the background too long) the page swaps in a fresh one from
+// /api/token and carries on -- see renewToken().
+let TOKEN = {{ token | tojson }};
+// 0 on the LAN, where the page never asks "still watching?".
 const IDLE_MS = {{ idle_prompt_seconds }} * 1000;
 const BEAT_MS = 60000;
 
@@ -1264,16 +1277,62 @@ let beat = null;
 const isWatching = () => !document.hidden && !dlg.open &&
   (overlay.hidden ? tiles.some(v => !v.paused) : !overlayVideo.paused);
 
-// 410 means the server already let this page's token go (it sat in the
-// background past the heartbeat timeout). Every stream would 403 on it, so
-// a reload -- which mints a fresh one -- is the only useful answer.
+const endedDlg = document.getElementById('ended');
+document.getElementById('endedLogin').addEventListener('click', () => {
+  location.href = '/login?next=/';
+});
+
+// The administrator ended this session (audit page). Streams are already
+// cut server-side; stop asking for more and say why.
+function showEnded() {
+  clearInterval(beat); beat = null;
+  stopTiles(); stopVideo(overlayVideo);
+  if (dlg.open) dlg.close();
+  if (!endedDlg.open) endedDlg.showModal();
+}
+
+// Restart whatever is on screen, in place: the open camera at the same
+// quality and sound, or the tiles. Used after a token swap and on return
+// from the background -- never a page reload, which is what used to throw
+// viewers out of full screen.
+function restartView() {
+  if (!overlay.hidden && current) loadOverlay(current, currentQuality, soundOn);
+  else if (overlay.hidden && !dlg.open) startTiles();
+}
+
+// The server no longer knows this page's token -- livecam restarted (a
+// deploy) or the page sat in the background past the timeout. Ask for a
+// replacement rather than reloading. Only if that fails does the page fall
+// back to a reload.
+async function renewToken() {
+  try {
+    const r = await fetch('/api/token', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({old: TOKEN})
+    });
+    if (r.status === 403) { showEnded(); return false; }
+    if (r.status === 401) { location.href = '/login?next=/'; return false; }
+    if (!r.ok) throw new Error(`token ${r.status}`);
+    TOKEN = (await r.json()).token;
+    return true;
+  } catch (e) {
+    location.reload();
+    return false;
+  }
+}
+
+// One heartbeat. Returns 'ok', 'renewed' (token was replaced -- streams
+// need restarting on the new one), 'ended', or 'error'.
 async function postBeat() {
   const r = await fetch('/api/heartbeat', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({token: TOKEN, watching: isWatching()})
   });
-  if (r.status === 410) location.reload();
-  return r;
+  if (r.status === 410) return (await renewToken()) ? 'renewed' : 'ended';
+  if (r.status === 403) { showEnded(); return 'ended'; }
+  // Login expired (24h on the public site) -- the login page brings them back.
+  if (r.status === 401) { location.href = '/login?next=/'; return 'ended'; }
+  return r.ok ? 'ok' : 'error';
 }
 
 async function sendBeat() {
@@ -1281,8 +1340,10 @@ async function sendBeat() {
   // must not come back to a "still watching?" prompt -- the streams were
   // already stopped when it went to the background.
   if (document.hidden) return;
-  if (Date.now() - lastActive > IDLE_MS) return pauseAll();
-  try { await postBeat(); } catch (e) { /* transient; next beat retries */ }
+  if (IDLE_MS > 0 && Date.now() - lastActive > IDLE_MS) return pauseAll();
+  try {
+    if ((await postBeat()) === 'renewed') restartView();
+  } catch (e) { /* transient; next beat retries */ }
 }
 
 function pauseAll() {
@@ -1382,9 +1443,9 @@ async function resumeFromBackground() {
   // the activity timer while it was hidden.
   lastActive = Date.now();
   try {
-    // A beat first: if the token lapsed while hidden this reloads instead,
-    // rather than restarting streams that would all be refused.
-    if ((await postBeat()).status === 410) return;
+    // A beat first: if the token lapsed while hidden this swaps in a fresh
+    // one, so the restart below uses a token the server will accept.
+    if ((await postBeat()) === 'ended') return;
   } catch (e) { /* offline for a moment; the streams' own retry covers it */ }
   if (was.camera && !overlay.hidden && current === was.camera) {
     loadOverlay(was.camera, was.quality, was.sound);

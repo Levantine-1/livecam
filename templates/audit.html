@@ -26,6 +26,15 @@
   td.num { text-align:right; font-variant-numeric:tabular-nums; }
   .route { font-size:.7rem; padding:.1rem .4rem; border-radius:4px; background:#2a2f3a; color:#9aa3b2; }
   .route.WAN { background:#3a2f19; color:#f0d9a8; }
+  h2 { font-size:.95rem; margin:1.5rem 0 .6rem; }
+  h2:first-child { margin-top:0; }
+  .live { color:#7fd18b; }
+  .ended { color:#e8a07a; font-size:.75rem; }
+  button.kill { background:#5a2a2a; color:#ffd9d9; border:0; border-radius:6px; padding:.3rem .7rem;
+                font-size:.8rem; cursor:pointer; }
+  button.kill:hover { background:#7a3333; }
+  button.kill:disabled { opacity:.5; cursor:default; }
+  .me { font-size:.7rem; color:#9aa3b2; }
 </style>
 </head>
 <body>
@@ -36,6 +45,20 @@
   <a href="/">&larr; live view</a>
 </header>
 <main>
+  <h2>Active sessions</h2>
+  <p class="note">Pages open right now. <em>Terminate</em> stops that device's video immediately and
+    signs it out; other devices on the same account keep watching. Refreshes every 10 seconds.</p>
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr><th>User</th><th>Device</th><th>IP</th><th>Route</th><th>Since</th>
+            <th>Watching</th><th>Data</th><th></th></tr>
+      </thead>
+      <tbody id="active"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <h2>History</h2>
   <p class="note">
     Every visit to the live view over the last {{ days }} days. <em>Watched</em> counts only time a
     video was actually playing on screen &mdash; not time in a background tab or a locked phone.
@@ -59,6 +82,10 @@
           <td class="num" data-seconds="{{ v.watched_seconds }}"></td>
           <td class="num" data-bytes="{{ v.bytes }}"></td>
         </tr>
+        {% if v.terminated_at %}
+        <tr><td colspan="7" class="ended">&uarr; ended by {{ v.terminated_by }} at
+          <span data-ts="{{ v.terminated_at }}"></span></td></tr>
+        {% endif %}
         {% endfor %}
       </tbody>
     </table>
@@ -82,12 +109,64 @@ document.querySelectorAll('[data-seconds]').forEach(td => {
   td.textContent = h ? `${h}h ${m}m` : m ? `${m}m ${sec}s` : `${sec}s`;
 });
 
-document.querySelectorAll('[data-bytes]').forEach(td => {
+const fmtBytes = b => {
   const u = ['B','KB','MB','GB','TB'];
-  let i = 0, n = Number(td.dataset.bytes);
+  let i = 0, n = Number(b);
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-  td.textContent = `${n < 10 && i > 0 ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
+  return `${n < 10 && i > 0 ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
+};
+document.querySelectorAll('[data-bytes]').forEach(td => { td.textContent = fmtBytes(td.dataset.bytes); });
+
+// --- active sessions ------------------------------------------------------
+const active = document.getElementById('active');
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function loadActive() {
+  let rows;
+  try {
+    const r = await fetch('/api/sessions');
+    if (!r.ok) throw new Error(r.status);
+    rows = await r.json();
+  } catch (e) {
+    active.innerHTML = '<tr><td colspan="8" class="empty">Could not load active sessions.</td></tr>';
+    return;
+  }
+  if (!rows.length) {
+    active.innerHTML = '<tr><td colspan="8" class="empty">Nobody has a page open.</td></tr>';
+    return;
+  }
+  active.innerHTML = rows.map(s => `
+    <tr>
+      <td>${esc(s.user)}${s.self ? ' <span class="me">(this browser)</span>' : ''}</td>
+      <td>${esc(s.device)}</td>
+      <td>${esc(s.ip)}</td>
+      <td><span class="route ${esc(s.route)}">${esc(s.route)}</span></td>
+      <td>${s.started ? when.format(new Date(s.started * 1000)) : ''}</td>
+      <td>${s.watching.length
+            ? s.watching.map(w => `<span class="live">&#9679;</span> ${esc(w.camera)} &middot; ${esc(w.quality)}`).join('<br>')
+            : '<span class="me">idle</span>'}</td>
+      <td class="num">${fmtBytes(s.bytes)}</td>
+      <td><button class="kill" data-token="${esc(s.token)}" data-self="${s.self ? 1 : ''}"
+                  data-label="${esc(s.user)} on ${esc(s.device)}">Terminate</button></td>
+    </tr>`).join('');
+}
+
+active.addEventListener('click', async e => {
+  const b = e.target.closest('button.kill');
+  if (!b) return;
+  const msg = b.dataset.self
+    ? 'This is your own session. Terminating it signs THIS browser out too. Continue?'
+    : `Terminate ${b.dataset.label}? Its video stops now and it will have to log in again.`;
+  if (!confirm(msg)) return;
+  b.disabled = true;
+  const r = await fetch(`/api/sessions/${encodeURIComponent(b.dataset.token)}/terminate`, {method: 'POST'});
+  if (b.dataset.self && r.ok) { location.href = '/login'; return; }
+  if (!r.ok && r.status !== 404) alert(`Could not terminate (HTTP ${r.status}).`);
+  loadActive();
 });
+
+loadActive();
+setInterval(loadActive, 10000);
 </script>
 </body>
 </html>

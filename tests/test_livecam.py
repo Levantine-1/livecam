@@ -282,7 +282,7 @@ def main():
     check("home banner shown on the public hostname",
           'id="homeBanner"' in page and LAN in page)
     check("usage meter rendered", 'id="usage"' in page)
-    token = re.search(r'const TOKEN = "([^"]+)"', page).group(1)
+    token = re.search(r'let TOKEN = "([^"]+)"', page).group(1)
 
     r = c.get("/", headers={"Host": LAN})
     check("home banner absent on the LAN hostname",
@@ -668,7 +668,7 @@ def main():
     # Segments must stop being served once the page's heartbeat lapses, the
     # same rule the MP4 path applies per chunk.
     hb_page = session_probe.get("/", headers={"Host": LAN}).get_data(as_text=True)
-    hb_token = re.search(r'const TOKEN = "([^"]+)"', hb_page).group(1)
+    hb_token = re.search(r'let TOKEN = "([^"]+)"', hb_page).group(1)
     with livecam._hls_lock:
         livecam._hls_sessions["beatsid"] = {
             "user": "admin", "camera": "the-boiz", "quality": "sub",
@@ -703,7 +703,7 @@ def main():
     part.post("/login", data={"username": "partial", "password": PASSWORD},
               headers={"Host": PUB})
     ppage = part.get("/", headers={"Host": PUB}).get_data(as_text=True)
-    ptok = re.search(r'const TOKEN = "([^"]+)"', ppage).group(1)
+    ptok = re.search(r'let TOKEN = "([^"]+)"', ppage).group(1)
     check("the audio-enabled set reaches the client for per-camera UI",
           '"the-boiz"' in ppage and "AUDIO_CAMERAS" in ppage)
     check("permitted camera gets the audio stream when asked",
@@ -719,11 +719,11 @@ def main():
         pub_idle, pub_beat = livecam.idle_settings()
     with app.test_request_context("/", headers={"Host": LAN}):
         lan_idle, lan_beat = livecam.idle_settings()
-    check("LAN gets the long idle window, public keeps the short one",
-          lan_idle > pub_idle and lan_idle == 8 * 3600, (pub_idle, lan_idle))
-    check("the browser still gives up before the server on both routes",
-          pub_idle < pub_beat and lan_idle < lan_beat,
-          (pub_idle, pub_beat, lan_idle, lan_beat))
+    check("the LAN never prompts 'still watching?', public keeps its prompt",
+          lan_idle == 0 and pub_idle > 0, (pub_idle, lan_idle))
+    check("on the public site the browser still gives up before the server",
+          pub_idle < pub_beat, (pub_idle, pub_beat))
+    check("a dead LAN tab is still let go of eventually", 0 < lan_beat <= 3600, lan_beat)
 
     # --- back-to-live injection is HTML-only ---
     html = b"<html><body><div id=\"root\"></div></body></html>"
@@ -1105,7 +1105,7 @@ def main():
                "Gecko) Chrome/130.0 Safari/537.36 Edg/130.0")
     page = viewer.get("/", headers={"Host": PUB, "User-Agent": edge_ua,
                                     "X-Forwarded-For": "203.0.113.7"}).get_data(as_text=True)
-    view_token = re.search(r'const TOKEN = "([^"]+)"', page).group(1)
+    view_token = re.search(r'let TOKEN = "([^"]+)"', page).group(1)
     row = next((v for v in livecam.audit_recent() if v["token"] == view_token), None)
     check("a dashboard load opens an audit row with device, IP and route",
           row is not None and row["device"] == "Edge on Windows"
@@ -1163,6 +1163,109 @@ def main():
           'let preferredQuality = "full";' in lan_page)
     check("the full-screen bar has a data-left badge", 'id="overlayLeft"' in page)
     check("the expanded video sits in a zoomable stage", 'id="videoStage"' in page)
+
+    # --- recovering in place instead of reloading (2026-10-25) ---
+    # livecam restarting (a deploy, or the hourly restart loop the expired
+    # cert caused) forgets every token; the page used to reload and drop out
+    # of full screen. It now swaps in a fresh token from /api/token.
+    renew_c = app.test_client()
+    renew_c.post("/login", data={"username": "admin", "password": PASSWORD}, headers={"Host": LAN})
+    page = renew_c.get("/", headers={"Host": LAN}).get_data(as_text=True)
+    old_token = re.search(r'let TOKEN = "([^"]+)"', page).group(1)
+    with livecam._sessions_lock:
+        livecam._live_sessions.pop(old_token)  # what a restart does
+    r = renew_c.post("/api/heartbeat", json={"token": old_token}, headers={"Host": LAN})
+    check("a forgotten token answers 410 (not a crash, not ok)", r.status_code == 410, r.status_code)
+    r = renew_c.post("/api/token", json={"old": old_token}, headers={"Host": LAN})
+    new_token = (r.json or {}).get("token")
+    check("/api/token hands back a fresh token",
+          r.status_code == 200 and new_token and new_token != old_token, r.status_code)
+    r = renew_c.post("/api/heartbeat", json={"token": new_token}, headers={"Host": LAN})
+    check("the fresh token is live", r.status_code == 200, r.status_code)
+    rows = livecam.audit_rows([old_token, new_token])
+    check("the visit's audit row moved to the new token (still one visit)",
+          new_token in rows and old_token not in rows, list(rows))
+    check("the page swaps tokens in place rather than reloading on 410",
+          "renewToken()" in page and "/api/token" in page
+          and "if (r.status === 410) location.reload()" not in page)
+    check("the LAN page never prompts", "const IDLE_MS = 0 * 1000" in page)
+
+    # --- LAN stays logged in while watching ---
+    with renew_c.session_transaction(base_url=f"http://{LAN}") as sess:
+        sess["login_at"] = time.time() - 23 * 3600
+    renew_c.post("/api/heartbeat", json={"token": new_token, "watching": False}, headers={"Host": LAN})
+    with renew_c.session_transaction(base_url=f"http://{LAN}") as sess:
+        unchanged = sess["login_at"]
+    check("a LAN beat with nothing playing doesn't extend the login",
+          time.time() - unchanged > 22 * 3600, unchanged)
+    renew_c.post("/api/heartbeat", json={"token": new_token, "watching": True}, headers={"Host": LAN})
+    with renew_c.session_transaction(base_url=f"http://{LAN}") as sess:
+        slid = sess["login_at"]
+    check("a LAN beat while watching slides the 24h login forward", time.time() - slid < 5, slid)
+
+    pub_c = app.test_client()
+    pub_c.post("/login", data={"username": "admin", "password": PASSWORD}, headers={"Host": PUB})
+    pub_token = re.search(r'let TOKEN = "([^"]+)"',
+                          pub_c.get("/", headers={"Host": PUB}).get_data(as_text=True)).group(1)
+    with pub_c.session_transaction(base_url=f"http://{PUB}") as sess:
+        sess["login_at"] = time.time() - 23 * 3600
+    pub_c.post("/api/heartbeat", json={"token": pub_token, "watching": True}, headers={"Host": PUB})
+    with pub_c.session_transaction(base_url=f"http://{PUB}") as sess:
+        check("the public site never slides the login, even while watching",
+              time.time() - sess["login_at"] > 22 * 3600, sess["login_at"])
+
+    # --- active sessions + terminate ---
+    phone = app.test_client()
+    phone.post("/login", data={"username": "admin", "password": PASSWORD}, headers={"Host": PUB})
+    iphone_ua = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 "
+                 "(KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1")
+    phone_token = re.search(r'let TOKEN = "([^"]+)"', phone.get(
+        "/", headers={"Host": PUB, "User-Agent": iphone_ua}).get_data(as_text=True)).group(1)
+    # A stream in flight under the phone's token, as pump() registers it.
+    with livecam._sessions_lock:
+        livecam._token_streams[phone_token] = {object(): {"camera": "baby-ptz", "quality": "full",
+                                                          "since": time.time()}}
+
+    nosy = app.test_client()
+    nosy.post("/login", data={"username": "partial", "password": PASSWORD}, headers={"Host": PUB})
+    check("active sessions need the audit grant",
+          nosy.get("/api/sessions", headers={"Host": PUB}).status_code == 403)
+    check("so does terminating one",
+          nosy.post(f"/api/sessions/{phone_token}/terminate", headers={"Host": PUB}).status_code == 403)
+
+    r = renew_c.get("/api/sessions", headers={"Host": LAN})
+    listed = {s["token"]: s for s in (r.json or [])}
+    ph = listed.get(phone_token, {})
+    check("active sessions lists the phone with device, route and what it's watching",
+          r.status_code == 200 and ph.get("device") == "Safari on iPhone" and ph.get("route") == "WAN"
+          and ph.get("watching") == [{"camera": "Baby Ptz", "quality": "HD"}], ph)
+    check("the caller's own page is marked as this browser",
+          listed.get(new_token, {}).get("self") is True and ph.get("self") is False)
+
+    r = renew_c.post(f"/api/sessions/{phone_token}/terminate", headers={"Host": LAN})
+    check("terminate succeeds", r.status_code == 200, r.status_code)
+    check("the terminated page is gone from active sessions",
+          phone_token not in {s["token"] for s in renew_c.get("/api/sessions", headers={"Host": LAN}).json})
+    r = phone.post("/api/heartbeat", json={"token": phone_token}, headers={"Host": PUB})
+    check("the terminated device is told it was ended (not just logged out)",
+          r.status_code == 403 and (r.json or {}).get("terminated") is True, (r.status_code, r.data[:80]))
+    r = phone.post("/api/token", json={"old": phone_token}, headers={"Host": PUB})
+    check("it can't mint itself a replacement token", r.status_code in (401, 403), r.status_code)
+    r = phone.get("/", headers={"Host": PUB, "Accept": "text/html"})
+    check("reloading sends the terminated device to the login page",
+          r.status_code == 302 and "/login" in r.headers["Location"], r.status_code)
+    check("other devices on the same account keep working",
+          renew_c.post("/api/heartbeat", json={"token": new_token}, headers={"Host": LAN}).status_code == 200
+          and pub_c.post("/api/heartbeat", json={"token": pub_token}, headers={"Host": PUB}).status_code == 200)
+    row = livecam.audit_rows([phone_token]).get(phone_token, {})
+    check("the audit history records who ended it", row.get("terminated_by") == "admin", row)
+
+    # Revocation must outlive a restart: rebuild the in-memory set from disk.
+    livecam._revoked_sids = None
+    r = phone.get("/", headers={"Host": PUB, "Accept": "text/html"})
+    phone.post("/login", data={"username": "admin", "password": PASSWORD}, headers={"Host": PUB})
+    check("logging in again after termination works (new session id)",
+          phone.get("/", headers={"Host": PUB}).status_code == 200)
 
     # --- LAN switch: ping, handoff ---
     fresh = app.test_client()
